@@ -1,0 +1,32 @@
+[package]
+name = "oblivious-linear-scan-map"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+ark-bn254 = "0.5"
+ark-ff = "0.5"
+ark-serialize = "0.5"
+eyre = "0.6"
+mpc-core = { version = "0.9", git = "https://github.com/TaceoLabs/co-snarks", rev = "531d08c" }
+mpc-net = { version = "0.4", git = "https://github.com/TaceoLabs/co-snarks", rev = "531d08c", features = ["local"] }
+num-bigint = { version = "0.4" }
+rand = { version = "0.8" }
+itertools = { version = "0.14" }
+rayon = { version = "1.11" }
+
+[dev-dependencies]
+criterion = "0.5"
+rand_chacha = "0.3"
+
+[[bench]]
+name = "is_zero"
+harness = false
+
+[[bench]]
+name = "xor_keys"
+harness = false
+
+[[bench]]
+name = "dot"
+harness = false
