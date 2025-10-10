@@ -17,16 +17,20 @@ use mpc_core::{
 use mpc_net::Network;
 
 use crate::rep3::Rep3BigIntShare;
+mod insert;
+mod read;
 pub mod rep3;
+mod update;
 
 pub const DELETED_LEAF_VALUE: u64 = 0xDEADBEEF;
 pub const LINEAR_SCAN_TREE_DEPTH: usize = 32;
 
+#[derive(Clone)]
 pub struct ObliviousMembershipProof<F: PrimeField>(pub Vec<ObliviousMerkleWitnessElement<F>>);
 
 struct NetworkRound1Result<F: PrimeField>(Vec<Rep3RingShare<Bit>>, Vec<Rep3PrimeFieldShare<F>>);
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 /// A witness of proving one layer in a Merkle tree.
 pub struct ObliviousMerkleWitnessElement<F: PrimeField> {
     /// Determines the other value required to compute the hash for the next layer.
@@ -76,278 +80,39 @@ impl<F: PrimeField> LinearScanObliviousMap<F> {
         }
     }
 
-    pub fn read<N: Rep3NetworkExt>(
-        &self,
-        key: Rep3RingShare<u32>,
-        net0: &N,
-        net1: &N,
-        state: &mut Rep3State,
-    ) -> eyre::Result<(Rep3PrimeFieldShare<F>, ObliviousMembershipProof<F>)> {
-        // Per layer we have to compare the neighbor key to all elements to get the Merkle path. We also have to find the element in the first layer.
-        let (key_bits, to_compare) = self.xor_read(key);
-
-        let NetworkRound1Result(ohv_layer, bitinject) =
-            Self::network_round1(&key_bits, to_compare, net0, net1, state)?;
-
-        // TODO maybe find a way to dedup the code here
-        let mut dots_a = Vec::with_capacity(LINEAR_SCAN_TREE_DEPTH);
-        // Start with finding the read element in the first layer
-        dots_a.push(Self::dot(
-            &ohv_layer[0..self.leaf_count],
-            &self.layers[0].values,
-            self.defaults[0],
-            state,
-        ));
-        // Then find the path
-        let mut start = self.leaf_count;
-        for (layer, default) in izip!(self.layers.iter(), self.defaults) {
-            let end = start + layer.keys.len();
-            let dot = Self::dot(&ohv_layer[start..end], &layer.values, default, state);
-            start = end;
-            dots_a.push(dot);
-        }
-        let dots_b = net0.reshare_many(&dots_a)?;
-        let dots = izip!(dots_a, dots_b)
-            .map(|(a, b)| Rep3BigUintShare::<F>::new(a.into(), b.into()))
-            .collect_vec();
-
-        let dots = conversion::b2a_many(&dots, net0, state)?;
-        let read = dots[0];
-
-        let path = izip!(dots.into_iter().skip(1), bitinject)
-            .map(|(other, position)| ObliviousMerkleWitnessElement { other, position })
-            .collect_vec();
-
-        Ok((read, ObliviousMembershipProof(path)))
-    }
-
-    pub fn insert<N: Rep3NetworkExt>(
-        &mut self,
-        mut key: Rep3RingShare<u32>,
-        value: Rep3PrimeFieldShare<F>,
-        net0: &N,
-        net1: &N,
-        state: &mut Rep3State,
-    ) -> eyre::Result<ObliviousMembershipProof<F>> {
-        let (key_bits, to_compare) = self.xor_insert(key);
-
-        let NetworkRound1Result(mut ohv_path, bitinject) =
-            Self::network_round1(&key_bits, to_compare, net0, net1, state)?;
-        // split the one-hot vectors for deduplication and index lookup
-        let ohv_dedup = ohv_path.split_off(self.total_count);
-
-        let path = self.compute_merkle_path(&ohv_path, bitinject, net0, state)?;
-
-        let poseidon2 = Poseidon2::<F, 2, 5>::default();
-
-        // Add the new hashes per layer
-        let mut poseidon2_precomputations =
-            poseidon2.precompute_rep3(LINEAR_SCAN_TREE_DEPTH, net0, state)?;
-        let mut layer_values = Vec::with_capacity(LINEAR_SCAN_TREE_DEPTH);
-        let mut current_value = value;
-        for p in path.iter() {
-            layer_values.push(current_value);
-            current_value = Self::poseidon2_cmux(
-                p,
-                current_value,
-                net0,
-                &poseidon2,
-                &mut poseidon2_precomputations,
-            )?;
-        }
-
-        let layer_values = conversion::a2b_many(&layer_values, net0, state)?;
-        for (layer, new_value) in self.layers.iter_mut().zip(layer_values.into_iter()) {
-            layer.values.push(new_value.try_into().expect("Works"));
-        }
-
-        std::thread::scope(|s| {
-            let root = s.spawn(|| arithmetic::open(current_value, net0));
-
-            // TODO we can move this up and do it during poseidon2 cmux
-            // Add the new key and deduplicate any similar ones
-            let shift = LINEAR_SCAN_TREE_DEPTH - 1;
-            self.layers[0].keys.push(key);
-            let mut start = 0;
-            for i in (0..self.layers.len()).skip(1) {
-                key.a >>= 1;
-                key.b >>= 1;
-                let end = start + self.layers[i].keys.len();
-
-                // Mark the other key as duplicate
-                for (oh, key_) in
-                    izip!(ohv_dedup[start..end].iter(), self.layers[i].keys.iter_mut())
-                {
-                    key_.a.0 ^= u32::from(oh.a.convert().convert()) << shift;
-                    key_.b.0 ^= u32::from(oh.b.convert().convert()) << shift;
-                }
-                self.layers[i].keys.push(key.to_owned());
-                start = end;
-            }
-
-            self.leaf_count += 1;
-            self.total_count += LINEAR_SCAN_TREE_DEPTH;
-            self.root = root.join().expect("can join")?;
-            eyre::Ok(())
-        })?;
-
-        Ok(ObliviousMembershipProof(path))
-    }
-
-    pub fn update<N: Rep3NetworkExt>(
-        &mut self,
-        key: Rep3RingShare<u32>,
-        value: Rep3PrimeFieldShare<F>,
-        net0: &N,
-        net1: &N,
-        state: &mut Rep3State,
-    ) -> eyre::Result<ObliviousMembershipProof<F>> {
-        let (key_bits, to_compare) = self.xor_update(key);
-        let NetworkRound1Result(mut ohv_updates, bitinject) =
-            Self::network_round1(&key_bits, to_compare, net0, net1, state)?;
-        let ohv_path = ohv_updates.split_off(self.total_count);
-
-        let path = self.compute_merkle_path(&ohv_path, bitinject, net0, state)?;
-        let poseidon2 = Poseidon2::<F, 2, 5>::default();
-
-        // Calculate the new hashes per layer
-        let mut poseidon2_precomputations =
-            poseidon2.precompute_rep3(LINEAR_SCAN_TREE_DEPTH, net0, state)?;
-
-        let mut layer_values = Vec::with_capacity(LINEAR_SCAN_TREE_DEPTH);
-        let mut current_value = value;
-        for p in path.iter() {
-            layer_values.push(current_value);
-            current_value = Self::poseidon2_cmux(
-                p,
-                current_value,
-                net0,
-                &poseidon2,
-                &mut poseidon2_precomputations,
-            )?;
-        }
-        let layer_values = conversion::a2b_many(&layer_values, net0, state)?;
-
-        // Update the full database, essentially a big cmux
-        let mut to_reshare = Vec::with_capacity(self.total_count);
-        let mut start = 0;
-        for (layer, new_value) in self.layers.iter().zip(layer_values) {
-            let end = start + layer.values.len();
-            let new_value = new_value.try_into().expect("Works");
-
-            for (value, ohv) in layer.values.iter().zip(ohv_updates[start..end].iter()) {
-                // Add the cmux: If ohv == 0, we keep the old value, else we update it
-                let other = &new_value ^ value;
-                let mut cmux = value.a.to_owned();
-                // This is the AND-gate protocol ohv_ & other
-                if ohv.a.0.convert() {
-                    cmux ^= other.a ^ other.b;
-                }
-                if ohv.b.0.convert() {
-                    cmux ^= other.a;
-                }
-                to_reshare.push(cmux);
-            }
-            start = end;
-        }
-        // Reshare also the root
-        to_reshare.push(current_value.b.into());
-        // Put the new values in
-        let mut reshared = net0.reshare_many(&to_reshare)?;
-        let mut start = 0;
-        for layer in self.layers.iter_mut() {
-            let end = start + layer.values.len();
-            for (value, (a, b)) in layer.values.iter_mut().zip(
-                to_reshare[start..end]
-                    .iter()
-                    .zip(reshared[start..end].iter()),
-            ) {
-                value.a = *a;
-                value.b = *b;
-            }
-            start = end;
-        }
-
-        // Update the root
-        self.root = F::from(reshared.pop().unwrap()) + current_value.a + current_value.b;
-
-        Ok(ObliviousMembershipProof(path))
-    }
-
     #[inline(always)]
-    pub fn depth(&self) -> usize {
+    pub const fn depth(&self) -> usize {
         LINEAR_SCAN_TREE_DEPTH
     }
 
-    fn xor_read(
+    pub fn verify_path<N: Network>(
         &self,
-        key: Rep3RingShare<u32>,
-    ) -> (Vec<Rep3RingShare<Bit>>, Vec<Rep3RingShare<u32>>) {
-        // To find the element
-        let (mut leaf_ohv, (key_bits, path)) = rayon::join(
-            || self.find_in_leaves(key),
-            || self.find_path_and_key_decompose(key),
-        );
-        leaf_ohv.extend(path);
-        (key_bits, leaf_ohv)
-    }
+        element: Rep3PrimeFieldShare<F>,
+        path: &ObliviousMembershipProof<F>,
+        net: &N,
+        state: &mut Rep3State,
+    ) -> eyre::Result<Rep3RingShare<Bit>> {
+        let poseidon2 = Poseidon2::<F, 2, 5>::default();
+        let mut poseidon2_precomputations =
+            poseidon2.precompute_rep3(LINEAR_SCAN_TREE_DEPTH, net, state)?;
 
-    fn xor_insert(
-        &self,
-        key: Rep3RingShare<u32>,
-    ) -> (Vec<Rep3RingShare<Bit>>, Vec<Rep3RingShare<u32>>) {
-        // To find the element
-        let (dedups, (key_bits, mut path)) = rayon::join(
-            || self.find_path_skip_leaves(key),
-            || self.find_path_and_key_decompose(key),
-        );
-        path.extend(dedups);
-        (key_bits, path)
-    }
-
-    fn xor_update(
-        &self,
-        key: Rep3RingShare<u32>,
-    ) -> (Vec<Rep3RingShare<Bit>>, Vec<Rep3RingShare<u32>>) {
-        // To find the element
-        let (mut updates, (key_bits, path)) = rayon::join(
-            || self.find_path(key),
-            || self.find_path_and_key_decompose(key),
-        );
-        updates.extend(path);
-        (key_bits, updates)
-    }
-
-    fn find_in_leaves(&self, needle: Rep3RingShare<u32>) -> Vec<Rep3RingShare<u32>> {
-        self.layers[0]
-            .keys
-            .iter()
-            .map(|hay| hay ^ &needle)
-            .collect_vec()
-    }
-
-    fn find_path(&self, mut needle: Rep3RingShare<u32>) -> Vec<Rep3RingShare<u32>> {
-        let mut result = Vec::with_capacity(self.total_count - self.leaf_count);
-        for layer in self.layers.iter() {
-            for hay in layer.keys.iter() {
-                result.push(hay ^ &needle);
-            }
-            needle.a >>= 1;
-            needle.b >>= 1;
+        let mut current_value = element;
+        for p in path.0.iter() {
+            current_value = Self::poseidon2_cmux(
+                p,
+                current_value,
+                net,
+                &poseidon2,
+                &mut poseidon2_precomputations,
+            )?;
         }
-        result
-    }
+        // current_value == self.root
+        let eq = arithmetic::eq_bit_public(current_value, self.root, net, state)?;
 
-    fn find_path_skip_leaves(&self, mut needle: Rep3RingShare<u32>) -> Vec<Rep3RingShare<u32>> {
-        let mut result = Vec::with_capacity(self.total_count - self.leaf_count);
-        for layer in self.layers.iter().skip(1) {
-            needle.a >>= 1;
-            needle.b >>= 1;
-            for hay in layer.keys.iter() {
-                result.push(hay ^ &needle);
-            }
-        }
-        result
+        // Translate to BitShare
+        let eq = Rep3RingShare::<Bit>::new(eq.a.bit(0).into(), eq.b.bit(0).into());
+
+        Ok(eq)
     }
 
     // finds the path of the member (its neighbors)
@@ -528,7 +293,9 @@ mod tests {
                     random_default_value,
                 );
                 let mut state = Rep3State::new(&n0, A2BType::Direct).expect("works");
-                map.read(key_share0, &n0, &n3, &mut state)
+                let (read, path) = map.read(key_share0, &n0, &n3, &mut state)?;
+                let check = map.verify_path(read, &path, &n0, &mut state)?;
+                eyre::Ok((read, check))
             });
 
             let res1 = s.spawn(|| {
@@ -536,7 +303,9 @@ mod tests {
                     random_default_value,
                 );
                 let mut state = Rep3State::new(&n1, A2BType::Direct).expect("works");
-                map.read(key_share1, &n1, &n4, &mut state)
+                let (read, path) = map.read(key_share1, &n1, &n4, &mut state)?;
+                let check = map.verify_path(read, &path, &n1, &mut state)?;
+                eyre::Ok((read, check))
             });
 
             let res2 = s.spawn(|| {
@@ -544,7 +313,9 @@ mod tests {
                     random_default_value,
                 );
                 let mut state = Rep3State::new(&n2, A2BType::Direct).expect("works");
-                map.read(key_share2, &n2, &n5, &mut state)
+                let (read, path) = map.read(key_share2, &n2, &n5, &mut state)?;
+                let check = map.verify_path(read, &path, &n2, &mut state)?;
+                eyre::Ok((read, check))
             });
             let res0 = res0.join().expect("can join").expect("did work");
             let res1 = res1.join().expect("can join").expect("did work");
@@ -552,11 +323,13 @@ mod tests {
             [res0, res1, res2]
         });
 
-        let (res0, _) = res0;
-        let (res1, _) = res1;
-        let (res2, _) = res2;
+        let (res0, check0) = res0;
+        let (res1, check1) = res1;
+        let (res2, check2) = res2;
         let result = res0 + res1 + res2;
+        let check = check0 ^ check1 ^ check2;
         assert_eq!(result.a, random_default_value);
+        assert!(check.a.convert().convert());
     }
 
     #[test]
@@ -700,13 +473,23 @@ mod tests {
                 );
                 let mut state = Rep3State::new(&n0, A2BType::Direct).expect("works");
                 let mut reads = Vec::with_capacity(TEST_SUITE);
+                let mut path_checks = Vec::with_capacity(TEST_SUITE * 3);
 
                 for (k, v, u) in izip!(key_share0, value_share0, update_share0) {
-                    map.insert(k, v, &n0, &n3, &mut state)?;
-                    map.update(k, u, &n0, &n3, &mut state)?;
-                    reads.push(map.read(k, &n0, &n3, &mut state)?);
+                    // insert
+                    let insert_path = map.insert(k, v, &n0, &n3, &mut state)?;
+                    path_checks.push(map.verify_path(v, &insert_path, &n0, &mut state)?);
+
+                    // update
+                    let update_path = map.update(k, u, &n0, &n3, &mut state)?;
+                    path_checks.push(map.verify_path(u, &update_path, &n0, &mut state)?);
+
+                    // verify
+                    let (read, read_path) = map.read(k, &n0, &n3, &mut state)?;
+                    path_checks.push(map.verify_path(read, &read_path, &n0, &mut state)?);
+                    reads.push(read);
                 }
-                eyre::Ok(reads)
+                eyre::Ok((reads, path_checks))
             });
 
             let res1 = s.spawn(|| {
@@ -715,13 +498,23 @@ mod tests {
                 );
                 let mut state = Rep3State::new(&n1, A2BType::Direct).expect("works");
                 let mut reads = Vec::with_capacity(TEST_SUITE);
+                let mut path_checks = Vec::with_capacity(TEST_SUITE * 3);
 
                 for (k, v, u) in izip!(key_share1, value_share1, update_share1) {
-                    map.insert(k, v, &n1, &n4, &mut state)?;
-                    map.update(k, u, &n1, &n4, &mut state)?;
-                    reads.push(map.read(k, &n1, &n4, &mut state)?);
+                    // insert
+                    let insert_path = map.insert(k, v, &n1, &n4, &mut state)?;
+                    path_checks.push(map.verify_path(v, &insert_path, &n1, &mut state)?);
+
+                    // update
+                    let update_path = map.update(k, u, &n1, &n4, &mut state)?;
+                    path_checks.push(map.verify_path(u, &update_path, &n1, &mut state)?);
+
+                    // verify
+                    let (read, read_path) = map.read(k, &n1, &n4, &mut state)?;
+                    path_checks.push(map.verify_path(read, &read_path, &n1, &mut state)?);
+                    reads.push(read);
                 }
-                eyre::Ok(reads)
+                eyre::Ok((reads, path_checks))
             });
 
             let res2 = s.spawn(|| {
@@ -730,12 +523,23 @@ mod tests {
                 );
                 let mut state = Rep3State::new(&n2, A2BType::Direct).expect("works");
                 let mut reads = Vec::with_capacity(TEST_SUITE);
+                let mut path_checks = Vec::with_capacity(TEST_SUITE * 3);
+
                 for (k, v, u) in izip!(key_share2, value_share2, update_share2) {
-                    map.insert(k, v, &n2, &n5, &mut state)?;
-                    map.update(k, u, &n2, &n5, &mut state)?;
-                    reads.push(map.read(k, &n2, &n5, &mut state)?);
+                    // insert
+                    let insert_path = map.insert(k, v, &n2, &n5, &mut state)?;
+                    path_checks.push(map.verify_path(v, &insert_path, &n2, &mut state)?);
+
+                    // update
+                    let update_path = map.update(k, u, &n2, &n5, &mut state)?;
+                    path_checks.push(map.verify_path(u, &update_path, &n2, &mut state)?);
+
+                    // verify
+                    let (read, read_path) = map.read(k, &n2, &n5, &mut state)?;
+                    path_checks.push(map.verify_path(read, &read_path, &n2, &mut state)?);
+                    reads.push(read);
                 }
-                eyre::Ok(reads)
+                eyre::Ok((reads, path_checks))
             });
             let res0 = res0.join().expect("can join").expect("did work");
             let res1 = res1.join().expect("can join").expect("did work");
@@ -743,11 +547,16 @@ mod tests {
             [res0, res1, res2]
         });
 
-        for (r0, r1, r2, should) in izip!(res0, res1, res2, updates) {
-            let (r0, _) = r0;
-            let (r1, _) = r1;
-            let (r2, _) = r2;
+        let (reads0, checks0) = res0;
+        let (reads1, checks1) = res1;
+        let (reads2, checks2) = res2;
+
+        for (r0, r1, r2, should) in izip!(reads0, reads1, reads2, updates) {
             assert_eq!((r0 + r1 + r2).a, should);
+        }
+
+        for (r0, r1, r2) in izip!(checks0, checks1, checks2) {
+            assert!((r0 + r1 + r2).a.convert().convert());
         }
     }
 }
