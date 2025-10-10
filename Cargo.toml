@@ -6,12 +6,15 @@ edition = "2024"
 [dependencies]
 ark-bn254 = "0.5"
 ark-ff = "0.5"
+ark-groth16 = "0.5"
 ark-serialize = "0.5"
 itertools = { version = "0.14" }
 num-bigint = { version = "0.4" }
 rand = { version = "0.8" }
 rayon = { version = "1.11" }
-
+tracing = "0.1.40"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+clap = { version = "4", features = ["derive", "env"] }
 
 co-circom = { version = "0.9.0", git = "https://github.com/TaceoLabs/co-snarks", rev = "b8d299289f70c9b0371fa3639ccd133532e74974" }
 co-noir = { version = "0.6.0", git = "https://github.com/TaceoLabs/co-snarks", rev = "b8d299289f70c9b0371fa3639ccd133532e74974" }
@@ -22,6 +25,12 @@ mpc-core = { version = "0.9.0", git = "https://github.com/TaceoLabs/co-snarks", 
 mpc-net = { version = "0.4.0", git = "https://github.com/TaceoLabs/co-snarks", rev = "b8d299289f70c9b0371fa3639ccd133532e74974", features = [
     "local",
 ] }
+rustls = "0.23"
+figment = { version = "0.10.19", features = ["toml", "env"] }
+serde = { version = "1.0.193", features = ["derive", "rc"] }
+rand_chacha = "0.3"
+
+
 
 
 

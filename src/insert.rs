@@ -1,4 +1,3 @@
-use ark_ff::PrimeField;
 use itertools::izip;
 use mpc_core::{
     gadgets::poseidon2::Poseidon2,
@@ -12,15 +11,15 @@ use crate::{
     LINEAR_SCAN_TREE_DEPTH, LinearScanObliviousMap, NetworkRound1Result, ObliviousMembershipProof,
 };
 
-impl<F: PrimeField> LinearScanObliviousMap<F> {
+impl LinearScanObliviousMap {
     pub fn insert<N: Rep3NetworkExt>(
         &mut self,
         mut key: Rep3RingShare<u32>,
-        value: Rep3PrimeFieldShare<F>,
+        value: Rep3PrimeFieldShare<ark_bn254::Fr>,
         net0: &N,
         net1: &N,
         state: &mut Rep3State,
-    ) -> eyre::Result<ObliviousMembershipProof<F>> {
+    ) -> eyre::Result<ObliviousMembershipProof> {
         let (key_bits, to_compare) = self.xor_insert(key);
 
         let NetworkRound1Result(mut ohv_path, bitinject) =
@@ -30,7 +29,7 @@ impl<F: PrimeField> LinearScanObliviousMap<F> {
 
         let path = self.compute_merkle_path(&ohv_path, bitinject, net0, state)?;
 
-        let poseidon2 = Poseidon2::<F, 2, 5>::default();
+        let poseidon2 = Poseidon2::<ark_bn254::Fr, 2, 5>::default();
 
         // Add the new hashes per layer
         let mut poseidon2_precomputations =

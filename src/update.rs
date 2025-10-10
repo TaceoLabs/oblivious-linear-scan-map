@@ -1,4 +1,3 @@
-use ark_ff::PrimeField;
 use mpc_core::{
     gadgets::poseidon2::Poseidon2,
     protocols::{
@@ -12,22 +11,22 @@ use crate::{
     ObliviousMembershipProof,
 };
 
-impl<F: PrimeField> LinearScanObliviousMap<F> {
+impl LinearScanObliviousMap {
     pub fn update<N: Rep3NetworkExt>(
         &mut self,
         key: Rep3RingShare<u32>,
-        value: Rep3PrimeFieldShare<F>,
+        value: Rep3PrimeFieldShare<ark_bn254::Fr>,
         net0: &N,
         net1: &N,
         state: &mut Rep3State,
-    ) -> eyre::Result<ObliviousMembershipProof<F>> {
+    ) -> eyre::Result<ObliviousMembershipProof> {
         let (key_bits, to_compare) = self.xor_update(key);
         let NetworkRound1Result(mut ohv_updates, bitinject) =
             Self::network_round1(&key_bits, to_compare, net0, net1, state)?;
         let ohv_path = ohv_updates.split_off(self.total_count);
 
         let path = self.compute_merkle_path(&ohv_path, bitinject, net0, state)?;
-        let poseidon2 = Poseidon2::<F, 2, 5>::default();
+        let poseidon2 = Poseidon2::<ark_bn254::Fr, 2, 5>::default();
 
         // Calculate the new hashes per layer
         let mut poseidon2_precomputations =
@@ -88,7 +87,8 @@ impl<F: PrimeField> LinearScanObliviousMap<F> {
         }
 
         // Update the root
-        self.root = F::from(reshared.pop().unwrap()) + current_value.a + current_value.b;
+        self.root =
+            ark_bn254::Fr::from(reshared.pop().unwrap()) + current_value.a + current_value.b;
 
         Ok(ObliviousMembershipProof(path))
     }
@@ -98,9 +98,10 @@ impl<F: PrimeField> LinearScanObliviousMap<F> {
         net0: &N,
         net1: &N,
         state: &mut Rep3State,
-    ) -> eyre::Result<ObliviousMembershipProof<F>> {
+    ) -> eyre::Result<ObliviousMembershipProof> {
         // The value in update is only ever used in CMUXes with a secret share, so we can not get any performance advantage by knowing this value in plain. Thus we just use the update protocol.
-        let deadbeef = arithmetic::promote_to_trivial_share(state.id, F::from(DELETED_LEAF_VALUE));
+        let deadbeef =
+            arithmetic::promote_to_trivial_share(state.id, ark_bn254::Fr::from(DELETED_LEAF_VALUE));
         self.update(key, deadbeef, net0, net1, state)
     }
 
@@ -110,14 +111,14 @@ impl<F: PrimeField> LinearScanObliviousMap<F> {
     ) -> (Vec<Rep3RingShare<Bit>>, Vec<Rep3RingShare<u32>>) {
         // To find the element
         let (mut updates, (key_bits, path)) = rayon::join(
-            || self.find_path(key),
+            || self.find_path_u(key),
             || self.find_path_and_key_decompose(key),
         );
         updates.extend(path);
         (key_bits, updates)
     }
 
-    fn find_path(&self, mut needle: Rep3RingShare<u32>) -> Vec<Rep3RingShare<u32>> {
+    fn find_path_u(&self, mut needle: Rep3RingShare<u32>) -> Vec<Rep3RingShare<u32>> {
         let mut result = Vec::with_capacity(self.total_count - self.leaf_count);
         for layer in self.layers.iter() {
             for hay in layer.keys.iter() {

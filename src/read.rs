@@ -1,112 +1,369 @@
-use ark_ff::PrimeField;
+use ark_ff::{One as _, Zero as _};
+use co_circom::{ConstraintMatrices, ProvingKey};
+use co_noir::{Bn254, Rep3AcvmType};
 use co_noir_to_r1cs::trace::MpcTraceHasher;
+use co_noir_to_r1cs::{noir::r1cs, r1cs::noir_proof_schema::NoirProofScheme};
 use itertools::{Itertools as _, izip};
 
 use mpc_core::{
+    MpcState as _,
     gadgets::poseidon2::Poseidon2,
     protocols::{
         rep3::{
-            Rep3BigUintShare, Rep3PrimeFieldShare, Rep3State, conversion, network::Rep3NetworkExt,
+            self, Rep3BigUintShare, Rep3PrimeFieldShare, Rep3State, conversion,
+            network::Rep3NetworkExt,
         },
-        rep3_ring::{Rep3RingShare, ring::bit::Bit},
+        rep3_ring::{Rep3RingShare, ring::ring_impl::RingElement},
     },
 };
 
-use crate::{
-    LINEAR_SCAN_TREE_DEPTH, LinearScanObliviousMap, NetworkRound1Result, ObliviousMembershipProof,
-    ObliviousMerkleWitnessElement,
-};
+use crate::{LINEAR_SCAN_TREE_DEPTH, LinearScanObliviousMap, ObliviousMerkleWitnessElement};
 
-impl<F: PrimeField> LinearScanObliviousMap<F> {
-    pub fn read_with_proof<N: Rep3NetworkExt>(
+// TODO make me not public
+#[allow(dead_code)]
+#[derive(Clone, Default)]
+pub struct ReadWithTrace {
+    pub(crate) read_value: Rep3PrimeFieldShare<ark_bn254::Fr>,
+    pub(crate) inputs: Vec<Rep3AcvmType<ark_bn254::Fr>>,
+    pub(crate) traces: Vec<Vec<Rep3AcvmType<ark_bn254::Fr>>>,
+}
+
+#[derive(Clone, Default)]
+pub struct PathAndWitness {
+    pub(crate) path: Vec<Rep3PrimeFieldShare<ark_bn254::Fr>>,
+    pub(crate) witness: Vec<Rep3PrimeFieldShare<ark_bn254::Fr>>,
+    pub(crate) positions: Vec<Rep3PrimeFieldShare<ark_bn254::Fr>>,
+}
+
+impl LinearScanObliviousMap {
+    #[expect(clippy::too_many_arguments)]
+    pub fn read_e2e<N: Rep3NetworkExt>(
         &self,
         key: Rep3RingShare<u32>,
         net0: &N,
         net1: &N,
-        state: &mut Rep3State,
-    ) -> eyre::Result<(Rep3PrimeFieldShare<F>, ObliviousMembershipProof<F>)> {
-        let (read, path) = self.read(key, net0, net1, state)?;
-        let hasher = Poseidon2::<F, 2, 5>::default();
-        let mut hasher_precomputations =
-            hasher.precompute_rep3(LINEAR_SCAN_TREE_DEPTH + 1, net0, state)?;
-        let mut inputs = Vec::new();
-        inputs.push(read.into());
-        for p in path.0.iter() {
-            inputs.push(p.position.into());
-        }
-
-        // hasher.hash_rep3_generate_noir_trace_many::<N, LINEAR_SCAN_TREE_DEPTH, LINEAR_SCAN_TREE_DEPTH>(
-        //     path,
-        //     &mut hasher_precomputations,
-        //     net0,
-        // )?;
-
-        todo!()
+        randomness_commitment: Rep3PrimeFieldShare<ark_bn254::Fr>,
+        state0: &mut Rep3State,
+        proof_schema: &NoirProofScheme<ark_bn254::Fr>,
+        cs: &ConstraintMatrices<ark_bn254::Fr>,
+        pk: &ProvingKey<Bn254>,
+    ) -> eyre::Result<(
+        Rep3PrimeFieldShare<ark_bn254::Fr>,
+        ark_groth16::Proof<Bn254>,
+        Vec<ark_bn254::Fr>,
+    )> {
+        let path_and_witness = self.read_path_and_witness_dot_mt(key, net0, net1, state0)?;
+        let trace = self.build_trace_from_path_and_witness(
+            net0,
+            path_and_witness,
+            randomness_commitment,
+            state0,
+        )?;
+        self.read_r1cs_proof(net0, net1, trace, state0, proof_schema, cs, pk)
     }
 
-    pub fn read<N: Rep3NetworkExt>(
+    #[expect(clippy::too_many_arguments)]
+    pub fn read_r1cs_proof<N: Rep3NetworkExt>(
+        &self,
+        net0: &N,
+        net1: &N,
+        read_with_trace: ReadWithTrace,
+        state0: &mut Rep3State,
+        proof_schema: &NoirProofScheme<ark_bn254::Fr>,
+        cs: &ConstraintMatrices<ark_bn254::Fr>,
+        pk: &ProvingKey<Bn254>,
+    ) -> eyre::Result<(
+        Rep3PrimeFieldShare<ark_bn254::Fr>,
+        ark_groth16::Proof<Bn254>,
+        Vec<ark_bn254::Fr>,
+    )> {
+        let ReadWithTrace {
+            read_value,
+            inputs,
+            traces,
+        } = read_with_trace;
+        let r1cs = r1cs::trace_to_r1cs_witness(inputs, traces, proof_schema, net0, net1, state0)?;
+
+        let witness = r1cs::r1cs_witness_to_cogroth16(proof_schema, r1cs, state0.id);
+        let (proof, public_inputs) = r1cs::prove(cs, pk, witness, net0, net1)?;
+        Ok((read_value, proof, public_inputs))
+    }
+
+    pub fn read_path_and_witness<N: Rep3NetworkExt>(
         &self,
         key: Rep3RingShare<u32>,
         net0: &N,
         net1: &N,
+        state0: &mut Rep3State,
+    ) -> eyre::Result<PathAndWitness> {
+        let mut state1 = state0.fork(1).expect("cannot fail for rep3");
+        let (path, (witness, positions)) = std::thread::scope(|s| {
+            let read_path = s.spawn(|| self.read_path(key, net0, state0));
+            let witness = s.spawn(|| self.read_merkle_witness(key, net1, &mut state1));
+            let path = read_path.join().expect("can join")?;
+            let witness = witness.join().expect("can join")?;
+            eyre::Ok((path, witness))
+        })?;
+        Ok(PathAndWitness {
+            path,
+            witness,
+            positions,
+        })
+    }
+
+    pub fn read_path_and_witness_is_zero_mt<N: Rep3NetworkExt>(
+        &self,
+        key: Rep3RingShare<u32>,
+        net0: &N,
+        net1: &N,
+        state0: &mut Rep3State,
+    ) -> eyre::Result<PathAndWitness> {
+        let mut state1 = state0.fork(1).expect("cannot fail for rep3");
+        let (path, (witness, positions)) = std::thread::scope(|s| {
+            let read_path = s.spawn(|| self.read_path_is_zero_many_mt(key, net0, state0));
+            let witness = s.spawn(|| self.read_merkle_witness(key, net1, &mut state1));
+            let path = read_path.join().expect("can join")?;
+            let witness = witness.join().expect("can join")?;
+            eyre::Ok((path, witness))
+        })?;
+        Ok(PathAndWitness {
+            path,
+            witness,
+            positions,
+        })
+    }
+
+    pub fn read_path_and_witness_dot_mt<N: Rep3NetworkExt>(
+        &self,
+        key: Rep3RingShare<u32>,
+        net0: &N,
+        net1: &N,
+        state0: &mut Rep3State,
+    ) -> eyre::Result<PathAndWitness> {
+        let mut state1 = state0.fork(1).expect("cannot fail for rep3");
+        let (path, (witness, positions)) = std::thread::scope(|s| {
+            let read_path = s.spawn(|| self.read_path_dots_mt(key, net0, state0));
+            let witness = s.spawn(|| self.read_merkle_witness(key, net1, &mut state1));
+            let path = read_path.join().expect("can join")?;
+            let witness = witness.join().expect("can join")?;
+            eyre::Ok((path, witness))
+        })?;
+        Ok(PathAndWitness {
+            path,
+            witness,
+            positions,
+        })
+    }
+    pub fn build_trace_from_path_and_witness<N: Rep3NetworkExt>(
+        &self,
+        net0: &N,
+        path_and_witness: PathAndWitness,
+        randomness_commitment: Rep3PrimeFieldShare<ark_bn254::Fr>,
+        state0: &mut Rep3State,
+    ) -> eyre::Result<ReadWithTrace> {
+        let PathAndWitness {
+            path,
+            witness,
+            positions,
+        } = path_and_witness;
+
+        let mut proof_inputs = Vec::with_capacity(65);
+        let read_value = path[0];
+
+        proof_inputs.push(read_value.into());
+        for p in positions.clone().into_iter() {
+            proof_inputs.push(p.into());
+        }
+
+        let hasher = Poseidon2::<ark_bn254::Fr, 2, 5>::default();
+        let mut hasher_precomputations =
+            hasher.precompute_rep3(LINEAR_SCAN_TREE_DEPTH + 1, net0, state0)?;
+
+        debug_assert_eq!(path.len(), witness.len());
+        let hashes = izip!(path.iter(), witness.iter())
+            .map(|(p, w)| w - p)
+            .collect_vec();
+
+        let switches = rep3::arithmetic::mul_vec(&positions, &hashes, net0, state0)?;
+
+        let mut merkle_membership = Vec::with_capacity(LINEAR_SCAN_TREE_DEPTH);
+        let mut ins = Vec::with_capacity(LINEAR_SCAN_TREE_DEPTH * 2);
+        for (p, w, mul, position) in
+            izip!(path.clone(), witness.clone(), switches, positions.clone())
+        {
+            proof_inputs.push(w.into());
+            let hash_left = mul + p;
+            let hash_right = w - mul;
+            ins.push(hash_left);
+            ins.push(hash_right);
+            merkle_membership.push(ObliviousMerkleWitnessElement { other: w, position });
+        }
+        // Calculate the commitment to the index
+        let mut index = Rep3PrimeFieldShare::zero();
+        for p in positions.iter().rev() {
+            index += index;
+            index += p;
+        }
+        ins.push(index);
+        ins.push(randomness_commitment);
+        proof_inputs.push(randomness_commitment.into());
+
+        let (_, traces) = hasher.hash_rep3_generate_noir_trace_many::<_, 33, 66>(
+            ins.try_into().expect("works"),
+            &mut hasher_precomputations,
+            net0,
+        )?;
+        Ok(ReadWithTrace {
+            read_value,
+            inputs: proof_inputs,
+            traces: traces.to_vec(),
+        })
+    }
+
+    pub fn read_path<N: Rep3NetworkExt>(
+        &self,
+        key: Rep3RingShare<u32>,
+        net: &N,
         state: &mut Rep3State,
-    ) -> eyre::Result<(Rep3PrimeFieldShare<F>, ObliviousMembershipProof<F>)> {
-        // Per layer we have to compare the neighbor key to all elements to get the Merkle path. We also have to find the element in the first layer.
-        let (key_bits, to_compare) = self.xor_read(key);
-
-        let NetworkRound1Result(ohv_layer, bitinject) =
-            Self::network_round1(&key_bits, to_compare, net0, net1, state)?;
-
-        // TODO maybe find a way to dedup the code here
+    ) -> eyre::Result<Vec<Rep3PrimeFieldShare<ark_bn254::Fr>>> {
+        let path_ohv = crate::rep3::is_zero_many(self.find_path(key), net, state)?;
         let mut dots_a = Vec::with_capacity(LINEAR_SCAN_TREE_DEPTH);
-        // Start with finding the read element in the first layer
-        dots_a.push(Self::dot(
-            &ohv_layer[0..self.leaf_count],
-            &self.layers[0].values,
-            self.defaults[0],
-            state,
-        ));
-        // Then find the path
-        let mut start = self.leaf_count;
+        let mut start = 0;
+        for (layer, default) in izip!(self.layers.iter(), self.defaults.into_iter()) {
+            let end = start + layer.keys.len();
+            let dot = Self::dot(&path_ohv[start..end], &layer.values, default, state);
+            start = end;
+            dots_a.push(dot);
+        }
+        let dots_b = net.reshare_many(&dots_a)?;
+        let dots = izip!(dots_a, dots_b)
+            .map(|(a, b)| Rep3BigUintShare::<ark_bn254::Fr>::new(a.into(), b.into()))
+            .collect_vec();
+
+        let dots = conversion::b2a_many(&dots, net, state)?;
+
+        Ok(dots)
+    }
+
+    pub fn read_path_dots_mt<N: Rep3NetworkExt>(
+        &self,
+        key: Rep3RingShare<u32>,
+        net: &N,
+        state: &mut Rep3State,
+    ) -> eyre::Result<Vec<Rep3PrimeFieldShare<ark_bn254::Fr>>> {
+        let path_ohv = crate::rep3::is_zero_many(self.find_path(key), net, state)?;
+        let mut dots_a = Vec::with_capacity(LINEAR_SCAN_TREE_DEPTH);
+        let mut start = 0;
+        let mut offsets = Vec::with_capacity(LINEAR_SCAN_TREE_DEPTH);
+        for layer in self.layers.iter() {
+            let end = start + layer.keys.len();
+            offsets.push((start, end));
+            start = end;
+        }
+        for (layer, default, (start, end)) in izip!(
+            self.layers.iter(),
+            self.defaults.into_iter(),
+            offsets.into_iter()
+        ) {
+            let dot = Self::dot(&path_ohv[start..end], &layer.values, default, state);
+            dots_a.push(dot);
+        }
+        let dots_b = net.reshare_many(&dots_a)?;
+        let dots = izip!(dots_a, dots_b)
+            .map(|(a, b)| Rep3BigUintShare::<ark_bn254::Fr>::new(a.into(), b.into()))
+            .collect_vec();
+
+        let dots = conversion::b2a_many(&dots, net, state)?;
+
+        Ok(dots)
+    }
+    pub fn read_path_is_zero_many_mt<N: Rep3NetworkExt>(
+        &self,
+        key: Rep3RingShare<u32>,
+        net: &N,
+        state: &mut Rep3State,
+    ) -> eyre::Result<Vec<Rep3PrimeFieldShare<ark_bn254::Fr>>> {
+        let path_ohv = crate::rep3::is_zero_many_mt(self.find_path(key), net, state)?;
+        let mut dots_a = Vec::with_capacity(LINEAR_SCAN_TREE_DEPTH);
+        let mut start = 0;
+        for (layer, default) in izip!(self.layers.iter(), self.defaults.into_iter()) {
+            let end = start + layer.keys.len();
+            let dot = Self::dot(&path_ohv[start..end], &layer.values, default, state);
+            start = end;
+            dots_a.push(dot);
+        }
+        let dots_b = net.reshare_many(&dots_a)?;
+        let dots = izip!(dots_a, dots_b)
+            .map(|(a, b)| Rep3BigUintShare::<ark_bn254::Fr>::new(a.into(), b.into()))
+            .collect_vec();
+
+        let dots = conversion::b2a_many(&dots, net, state)?;
+
+        Ok(dots)
+    }
+    #[expect(clippy::type_complexity)]
+    pub fn read_merkle_witness<N: Rep3NetworkExt>(
+        &self,
+        key: Rep3RingShare<u32>,
+        net: &N,
+        state: &mut Rep3State,
+    ) -> eyre::Result<(
+        Vec<Rep3PrimeFieldShare<ark_bn254::Fr>>,
+        Vec<Rep3PrimeFieldShare<ark_bn254::Fr>>,
+    )> {
+        // Per layer we have to compare the neighbor key to all elements to get the Merkle path. We also have to find the element in the first layer.
+        let witness_ohv = self.find_witness(key);
+        let key_bits = (0..32).map(|shift| (key >> shift).get_bit(0)).collect_vec();
+
+        // we could maybe parallelize this with another network, but the bitinject is negligible in contrast to the AND-tree and poseidon hashes, therefore we stick with one two networks.
+        let ohv_layer = crate::rep3::is_zero_many(witness_ohv, net, state)?;
+        let bitinject = crate::rep3::bit_inject_from_bits_to_field_many(&key_bits, net, state)?;
+
+        let mut dots_a = Vec::with_capacity(LINEAR_SCAN_TREE_DEPTH);
+        let mut start = 0;
         for (layer, default) in izip!(self.layers.iter(), self.defaults) {
             let end = start + layer.keys.len();
             let dot = Self::dot(&ohv_layer[start..end], &layer.values, default, state);
             start = end;
             dots_a.push(dot);
         }
-        let dots_b = net0.reshare_many(&dots_a)?;
+        let dots_b = net.reshare_many(&dots_a)?;
         let dots = izip!(dots_a, dots_b)
-            .map(|(a, b)| Rep3BigUintShare::<F>::new(a.into(), b.into()))
+            .map(|(a, b)| Rep3BigUintShare::new(a.into(), b.into()))
             .collect_vec();
 
-        let dots = conversion::b2a_many(&dots, net0, state)?;
-        let read = dots[0];
+        let dots = conversion::b2a_many(&dots, net, state)?;
 
-        let path = izip!(dots.into_iter().skip(1), bitinject)
-            .map(|(other, position)| ObliviousMerkleWitnessElement { other, position })
-            .collect_vec();
-
-        Ok((read, ObliviousMembershipProof(path)))
+        Ok((dots, bitinject))
     }
 
-    fn xor_read(
-        &self,
-        key: Rep3RingShare<u32>,
-    ) -> (Vec<Rep3RingShare<Bit>>, Vec<Rep3RingShare<u32>>) {
-        // To find the element
-        let (mut leaf_ohv, (key_bits, path)) = rayon::join(
-            || self.find_in_leaves(key),
-            || self.find_path_and_key_decompose(key),
-        );
-        leaf_ohv.extend(path);
-        (key_bits, leaf_ohv)
+    fn find_path(&self, mut needle: Rep3RingShare<u32>) -> Vec<Rep3RingShare<u32>> {
+        // To find the path
+        let mut path_ohv = Vec::with_capacity(self.total_count);
+        for layer in self.layers.iter() {
+            for hay in layer.keys.iter() {
+                path_ohv.push(hay ^ &needle);
+            }
+
+            needle.a >>= 1;
+            needle.b >>= 1;
+        }
+        path_ohv
     }
 
-    fn find_in_leaves(&self, needle: Rep3RingShare<u32>) -> Vec<Rep3RingShare<u32>> {
-        self.layers[0]
-            .keys
-            .iter()
-            .map(|hay| hay ^ &needle)
-            .collect_vec()
+    fn find_witness(&self, mut needle: Rep3RingShare<u32>) -> Vec<Rep3RingShare<u32>> {
+        // To find the path
+        let mut path_ohv = Vec::with_capacity(self.total_count);
+        let one = RingElement::one();
+        for layer in self.layers.iter() {
+            let neighbor_key = needle ^ one;
+            for hay in layer.keys.iter() {
+                path_ohv.push(hay ^ &neighbor_key);
+            }
+
+            needle.a >>= 1;
+            needle.b >>= 1;
+        }
+        path_ohv
     }
 }
