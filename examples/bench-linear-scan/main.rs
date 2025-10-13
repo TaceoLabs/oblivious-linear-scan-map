@@ -13,7 +13,7 @@ use mpc_net::{
     Network,
     tcp::{NetworkConfig, TcpNetwork},
 };
-use oblivious_linear_scan_map::{LinearScanObliviousMap, plain::LinearScanMap};
+use oblivious_linear_scan_map::LinearScanObliviousMap;
 use rand::{CryptoRng, Rng, SeedableRng};
 use rand_chacha::ChaCha12Rng;
 use serde::{Deserialize, Serialize};
@@ -23,6 +23,10 @@ use std::{
     thread::sleep,
     time::{Duration, Instant},
 };
+
+use crate::linear_map::LinearScanMap;
+
+mod linear_map;
 
 const SLEEP: Duration = Duration::from_millis(200);
 

@@ -49,16 +49,12 @@ impl LinearScanObliviousMap {
         state0: &mut Rep3State,
     ) -> eyre::Result<ObliviousReadResult> {
         let path_and_witness = self.read_path_and_witness(key, net0, net1, state0)?;
-        let trace = self.build_trace_from_path_and_witness(
-            net0,
-            path_and_witness,
-            randomness_commitment,
-            state0,
-        )?;
-        self.read_r1cs_proof(net0, net1, trace, state0)
+        let trace =
+            self.read_build_execution_trace(net0, path_and_witness, randomness_commitment, state0)?;
+        self.groth16_read_proof(net0, net1, trace, state0)
     }
 
-    fn read_r1cs_proof<N: Rep3NetworkExt>(
+    fn groth16_read_proof<N: Rep3NetworkExt>(
         &self,
         net0: &N,
         net1: &N,
@@ -110,12 +106,12 @@ impl LinearScanObliviousMap {
         })
     }
 
-    fn build_trace_from_path_and_witness<N: Rep3NetworkExt>(
+    fn read_build_execution_trace<N: Rep3NetworkExt>(
         &self,
-        net0: &N,
+        net: &N,
         path_and_witness: PathAndWitness,
         randomness_commitment: Rep3PrimeFieldShare<ark_bn254::Fr>,
-        state0: &mut Rep3State,
+        state: &mut Rep3State,
     ) -> eyre::Result<ReadWithTrace> {
         let PathAndWitness {
             path,
@@ -133,14 +129,14 @@ impl LinearScanObliviousMap {
 
         let hasher = Poseidon2::<ark_bn254::Fr, 2, 5>::default();
         let mut hasher_precomputations =
-            hasher.precompute_rep3(LINEAR_SCAN_TREE_DEPTH + 1, net0, state0)?;
+            hasher.precompute_rep3(LINEAR_SCAN_TREE_DEPTH + 1, net, state)?;
 
         debug_assert_eq!(path.len(), witness.len());
         let hashes = izip!(path.iter(), witness.iter())
             .map(|(p, w)| w - p)
             .collect_vec();
 
-        let switches = rep3::arithmetic::mul_vec(&positions, &hashes, net0, state0)?;
+        let switches = rep3::arithmetic::mul_vec(&positions, &hashes, net, state)?;
 
         let mut merkle_membership = Vec::with_capacity(LINEAR_SCAN_TREE_DEPTH);
         let mut ins = Vec::with_capacity(LINEAR_SCAN_TREE_DEPTH * 2);
@@ -167,7 +163,7 @@ impl LinearScanObliviousMap {
         let (_, traces) = hasher.hash_rep3_generate_noir_trace_many::<_, 33, 66>(
             ins.try_into().expect("works"),
             &mut hasher_precomputations,
-            net0,
+            net,
         )?;
         Ok(ReadWithTrace {
             read_value,

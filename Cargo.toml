@@ -8,35 +8,27 @@ ark-bn254 = "0.5"
 ark-ff = "0.5"
 ark-groth16 = "0.5"
 ark-serialize = "0.5"
-itertools = { version = "0.14" }
-num-bigint = { version = "0.4" }
-rand = { version = "0.8" }
-rayon = { version = "1.11" }
-tracing = "0.1.40"
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-clap = { version = "4", features = ["derive", "env"] }
-
 co-circom = { version = "0.9.0", git = "https://github.com/TaceoLabs/co-snarks", rev = "b8d299289f70c9b0371fa3639ccd133532e74974" }
 co-noir = { version = "0.6.0", git = "https://github.com/TaceoLabs/co-snarks", rev = "b8d299289f70c9b0371fa3639ccd133532e74974" }
 co-noir-to-r1cs = { version = "0.1.0", git = "https://github.com/TaceoLabs/CoNoir-to-R1CS", rev = "1e4eee506c1cf47d6830b0de1c8df02d7b6013ef" }
-co-ultrahonk = { version = "0.5.0", git = "https://github.com/TaceoLabs/co-snarks", rev = "b8d299289f70c9b0371fa3639ccd133532e74974" }
 eyre = "0.6.12"
+itertools = { version = "0.14" }
 mpc-core = { version = "0.9.0", git = "https://github.com/TaceoLabs/co-snarks", rev = "b8d299289f70c9b0371fa3639ccd133532e74974" }
 mpc-net = { version = "0.4.0", git = "https://github.com/TaceoLabs/co-snarks", rev = "b8d299289f70c9b0371fa3639ccd133532e74974", features = [
     "local",
 ] }
-rustls = "0.23"
-figment = { version = "0.10.19", features = ["toml", "env"] }
-serde = { version = "1.0.193", features = ["derive", "rc"] }
-rand_chacha = "0.3"
-
-
-
-
+rand = { version = "0.8" }
+rayon = { version = "1.11" }
 
 [dev-dependencies]
+clap = { version = "4", features = ["derive", "env"] }
 criterion = "0.5"
+figment = { version = "0.10.19", features = ["toml", "env"] }
 rand_chacha = "0.3"
+rustls = "0.23"
+serde = { version = "1.0.193", features = ["derive", "rc"] }
+tracing = "0.1.40"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 [[bench]]
 name = "is_zero"

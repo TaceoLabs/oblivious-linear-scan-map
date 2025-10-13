@@ -17,13 +17,14 @@ use mpc_core::{
 };
 use mpc_net::Network;
 
-use crate::{groth16::Groth16Material, rep3::Rep3BigIntShare};
+use crate::rep3::Rep3BigIntShare;
 mod groth16;
 mod insert;
-pub mod plain;
 pub mod read;
 pub mod rep3;
 mod update;
+
+pub use groth16::Groth16Material;
 
 pub const DELETED_LEAF_VALUE: u64 = 0xDEADBEEF;
 pub const LINEAR_SCAN_TREE_DEPTH: usize = 32;
@@ -43,13 +44,19 @@ pub struct ObliviousMerkleWitnessElement {
 }
 
 #[derive(Default, Debug, Clone)]
-pub(crate) struct Layer<F: PrimeField> {
+pub struct ObliviousLayer {
     keys: Vec<Rep3RingShare<u32>>,
-    values: Vec<Rep3BigIntShare<F>>,
+    values: Vec<Rep3BigIntShare<ark_bn254::Fr>>,
+}
+
+impl ObliviousLayer {
+    pub fn new(keys: Vec<Rep3RingShare<u32>>, values: Vec<Rep3BigIntShare<ark_bn254::Fr>>) -> Self {
+        Self { keys, values }
+    }
 }
 
 pub struct LinearScanObliviousMap {
-    layers: [Layer<ark_bn254::Fr>; LINEAR_SCAN_TREE_DEPTH],
+    layers: [ObliviousLayer; LINEAR_SCAN_TREE_DEPTH],
     leaf_count: usize,
     total_count: usize,
     defaults: [BigInteger256; LINEAR_SCAN_TREE_DEPTH],
@@ -73,11 +80,29 @@ impl LinearScanObliviousMap {
             prev
         });
         Self {
-            layers: std::array::from_fn(|_| Layer::default()),
+            layers: std::array::from_fn(|_| ObliviousLayer::default()),
             leaf_count: 0,
             total_count: 0,
             defaults,
             root: default_value,
+            read_groth16,
+        }
+    }
+
+    pub fn from_shared_values(
+        layers: [ObliviousLayer; LINEAR_SCAN_TREE_DEPTH],
+        leaf_count: usize,
+        total_count: usize,
+        defaults: [BigInteger256; LINEAR_SCAN_TREE_DEPTH],
+        root: ark_bn254::Fr,
+        read_groth16: Groth16Material,
+    ) -> Self {
+        Self {
+            layers,
+            leaf_count,
+            total_count,
+            defaults,
+            root,
             read_groth16,
         }
     }

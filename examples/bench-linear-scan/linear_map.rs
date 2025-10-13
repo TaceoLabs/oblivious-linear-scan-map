@@ -4,17 +4,16 @@ use mpc_core::{
     gadgets::poseidon2::Poseidon2,
     protocols::rep3_ring::{self, ring::ring_impl::RingElement},
 };
+use oblivious_linear_scan_map::{Groth16Material, LINEAR_SCAN_TREE_DEPTH, LinearScanObliviousMap};
 use rand::{CryptoRng, Rng};
 
-use crate::{LINEAR_SCAN_TREE_DEPTH, LinearScanObliviousMap, groth16::Groth16Material};
-
 #[derive(Debug, Default, Clone)]
-struct Layer<F: PrimeField> {
+struct Layer {
     keys: Vec<u32>,
-    values: Vec<F>,
+    values: Vec<ark_bn254::Fr>,
 }
 
-impl<F: PrimeField> Layer<F> {
+impl Layer {
     pub fn len(&self) -> usize {
         self.keys.len()
     }
@@ -23,7 +22,10 @@ impl<F: PrimeField> Layer<F> {
         self.keys.is_empty()
     }
 
-    pub fn share_ring<R: Rng + CryptoRng>(&self, rng: &mut R) -> [crate::Layer<F>; 3] {
+    pub fn share_ring<R: Rng + CryptoRng>(
+        &self,
+        rng: &mut R,
+    ) -> [oblivious_linear_scan_map::ObliviousLayer; 3] {
         debug_assert_eq!(self.keys.len(), self.values.len());
         let keys = self
             .keys
@@ -35,27 +37,18 @@ impl<F: PrimeField> Layer<F> {
             rep3_ring::share_ring_elements_binary(&keys, rng);
 
         let [value_shares0, value_shares1, value_shares2] =
-            crate::rep3::share_values_ring(&self.values, rng);
+            oblivious_linear_scan_map::rep3::share_values_ring(&self.values, rng);
 
-        let res0 = crate::Layer {
-            keys: key_shares0,
-            values: value_shares0,
-        };
-        let res1 = crate::Layer {
-            keys: key_shares1,
-            values: value_shares1,
-        };
-        let res2 = crate::Layer {
-            keys: key_shares2,
-            values: value_shares2,
-        };
+        let res0 = oblivious_linear_scan_map::ObliviousLayer::new(key_shares0, value_shares0);
+        let res1 = oblivious_linear_scan_map::ObliviousLayer::new(key_shares1, value_shares1);
+        let res2 = oblivious_linear_scan_map::ObliviousLayer::new(key_shares2, value_shares2);
 
         [res0, res1, res2]
     }
 }
 
 pub struct LinearScanMap {
-    layers: [Layer<ark_bn254::Fr>; LINEAR_SCAN_TREE_DEPTH],
+    layers: [Layer; LINEAR_SCAN_TREE_DEPTH],
     leaf_count: usize,
     defaults: [BigInteger256; LINEAR_SCAN_TREE_DEPTH],
     root: ark_bn254::Fr,
@@ -130,30 +123,30 @@ impl LinearScanMap {
         let (proof_schema, pk, cs) = r1cs::setup_r1cs(read_program, &mut rand::thread_rng())?;
         let read_material = Groth16Material::new(proof_schema, cs, pk.clone());
 
-        let res0 = LinearScanObliviousMap {
-            layers: layers0.try_into().expect("works"),
-            total_count,
+        let res0 = LinearScanObliviousMap::from_shared_values(
+            layers0.try_into().expect("works"),
             leaf_count,
-            root: self.root,
-            defaults: self.defaults,
-            read_groth16: read_material.clone(),
-        };
-        let res1 = LinearScanObliviousMap {
-            layers: layers1.try_into().expect("works"),
             total_count,
+            self.defaults,
+            self.root,
+            read_material.clone(),
+        );
+        let res1 = LinearScanObliviousMap::from_shared_values(
+            layers1.try_into().expect("works"),
             leaf_count,
-            root: self.root,
-            defaults: self.defaults,
-            read_groth16: read_material.clone(),
-        };
-        let res2 = LinearScanObliviousMap {
-            layers: layers2.try_into().expect("works"),
             total_count,
+            self.defaults,
+            self.root,
+            read_material.clone(),
+        );
+        let res2 = LinearScanObliviousMap::from_shared_values(
+            layers2.try_into().expect("works"),
             leaf_count,
-            root: self.root,
-            defaults: self.defaults,
-            read_groth16: read_material,
-        };
+            total_count,
+            self.defaults,
+            self.root,
+            read_material.clone(),
+        );
         Ok([res0, res1, res2])
     }
 }
