@@ -1,8 +1,7 @@
 use ark_ff::{One as _, Zero as _};
-use co_circom::{ConstraintMatrices, ProvingKey};
 use co_noir::{Bn254, Rep3AcvmType};
+use co_noir_to_r1cs::noir::r1cs;
 use co_noir_to_r1cs::trace::MpcTraceHasher;
-use co_noir_to_r1cs::{noir::r1cs, r1cs::noir_proof_schema::NoirProofScheme};
 use itertools::{Itertools as _, izip};
 
 use mpc_core::{
@@ -17,79 +16,79 @@ use mpc_core::{
     },
 };
 
-use crate::{LINEAR_SCAN_TREE_DEPTH, LinearScanObliviousMap, ObliviousMerkleWitnessElement};
+use crate::{
+    LINEAR_SCAN_TREE_DEPTH, LinearScanObliviousMap, ObliviousMerkleWitnessElement,
+    groth16::Groth16Material,
+};
 
-// TODO make me not public
-#[allow(dead_code)]
-#[derive(Clone, Default)]
-pub struct ReadWithTrace {
-    pub(crate) read_value: Rep3PrimeFieldShare<ark_bn254::Fr>,
-    pub(crate) inputs: Vec<Rep3AcvmType<ark_bn254::Fr>>,
-    pub(crate) traces: Vec<Vec<Rep3AcvmType<ark_bn254::Fr>>>,
+struct ReadWithTrace {
+    read_value: Rep3PrimeFieldShare<ark_bn254::Fr>,
+    inputs: Vec<Rep3AcvmType<ark_bn254::Fr>>,
+    traces: Vec<Vec<Rep3AcvmType<ark_bn254::Fr>>>,
 }
 
-#[derive(Clone, Default)]
-pub struct PathAndWitness {
-    pub(crate) path: Vec<Rep3PrimeFieldShare<ark_bn254::Fr>>,
-    pub(crate) witness: Vec<Rep3PrimeFieldShare<ark_bn254::Fr>>,
-    pub(crate) positions: Vec<Rep3PrimeFieldShare<ark_bn254::Fr>>,
+struct PathAndWitness {
+    path: Vec<Rep3PrimeFieldShare<ark_bn254::Fr>>,
+    witness: Vec<Rep3PrimeFieldShare<ark_bn254::Fr>>,
+    positions: Vec<Rep3PrimeFieldShare<ark_bn254::Fr>>,
+}
+
+pub struct ObliviousReadResult {
+    pub read: Rep3PrimeFieldShare<ark_bn254::Fr>,
+    pub proof: ark_groth16::Proof<Bn254>,
+    pub public_inputs: Vec<ark_bn254::Fr>,
 }
 
 impl LinearScanObliviousMap {
-    #[expect(clippy::too_many_arguments)]
-    pub fn read_e2e<N: Rep3NetworkExt>(
+    pub fn read<N: Rep3NetworkExt>(
         &self,
         key: Rep3RingShare<u32>,
         net0: &N,
         net1: &N,
         randomness_commitment: Rep3PrimeFieldShare<ark_bn254::Fr>,
         state0: &mut Rep3State,
-        proof_schema: &NoirProofScheme<ark_bn254::Fr>,
-        cs: &ConstraintMatrices<ark_bn254::Fr>,
-        pk: &ProvingKey<Bn254>,
-    ) -> eyre::Result<(
-        Rep3PrimeFieldShare<ark_bn254::Fr>,
-        ark_groth16::Proof<Bn254>,
-        Vec<ark_bn254::Fr>,
-    )> {
-        let path_and_witness = self.read_path_and_witness_dot_mt(key, net0, net1, state0)?;
+    ) -> eyre::Result<ObliviousReadResult> {
+        let path_and_witness = self.read_path_and_witness(key, net0, net1, state0)?;
         let trace = self.build_trace_from_path_and_witness(
             net0,
             path_and_witness,
             randomness_commitment,
             state0,
         )?;
-        self.read_r1cs_proof(net0, net1, trace, state0, proof_schema, cs, pk)
+        self.read_r1cs_proof(net0, net1, trace, state0)
     }
 
-    #[expect(clippy::too_many_arguments)]
-    pub fn read_r1cs_proof<N: Rep3NetworkExt>(
+    fn read_r1cs_proof<N: Rep3NetworkExt>(
         &self,
         net0: &N,
         net1: &N,
         read_with_trace: ReadWithTrace,
         state0: &mut Rep3State,
-        proof_schema: &NoirProofScheme<ark_bn254::Fr>,
-        cs: &ConstraintMatrices<ark_bn254::Fr>,
-        pk: &ProvingKey<Bn254>,
-    ) -> eyre::Result<(
-        Rep3PrimeFieldShare<ark_bn254::Fr>,
-        ark_groth16::Proof<Bn254>,
-        Vec<ark_bn254::Fr>,
-    )> {
+    ) -> eyre::Result<ObliviousReadResult> {
         let ReadWithTrace {
             read_value,
             inputs,
             traces,
         } = read_with_trace;
+
+        let Groth16Material {
+            proof_schema,
+            cs,
+            pk,
+        } = &self.read_groth16;
+
         let r1cs = r1cs::trace_to_r1cs_witness(inputs, traces, proof_schema, net0, net1, state0)?;
 
         let witness = r1cs::r1cs_witness_to_cogroth16(proof_schema, r1cs, state0.id);
         let (proof, public_inputs) = r1cs::prove(cs, pk, witness, net0, net1)?;
-        Ok((read_value, proof, public_inputs))
+        Ok(ObliviousReadResult {
+            read: read_value,
+            proof,
+            public_inputs,
+        })
     }
 
-    pub fn read_path_and_witness<N: Rep3NetworkExt>(
+    fn read_path_and_witness<N: Rep3NetworkExt>(
         &self,
         key: Rep3RingShare<u32>,
         net0: &N,
@@ -111,50 +110,7 @@ impl LinearScanObliviousMap {
         })
     }
 
-    pub fn read_path_and_witness_is_zero_mt<N: Rep3NetworkExt>(
-        &self,
-        key: Rep3RingShare<u32>,
-        net0: &N,
-        net1: &N,
-        state0: &mut Rep3State,
-    ) -> eyre::Result<PathAndWitness> {
-        let mut state1 = state0.fork(1).expect("cannot fail for rep3");
-        let (path, (witness, positions)) = std::thread::scope(|s| {
-            let read_path = s.spawn(|| self.read_path_is_zero_many_mt(key, net0, state0));
-            let witness = s.spawn(|| self.read_merkle_witness(key, net1, &mut state1));
-            let path = read_path.join().expect("can join")?;
-            let witness = witness.join().expect("can join")?;
-            eyre::Ok((path, witness))
-        })?;
-        Ok(PathAndWitness {
-            path,
-            witness,
-            positions,
-        })
-    }
-
-    pub fn read_path_and_witness_dot_mt<N: Rep3NetworkExt>(
-        &self,
-        key: Rep3RingShare<u32>,
-        net0: &N,
-        net1: &N,
-        state0: &mut Rep3State,
-    ) -> eyre::Result<PathAndWitness> {
-        let mut state1 = state0.fork(1).expect("cannot fail for rep3");
-        let (path, (witness, positions)) = std::thread::scope(|s| {
-            let read_path = s.spawn(|| self.read_path_dots_mt(key, net0, state0));
-            let witness = s.spawn(|| self.read_merkle_witness(key, net1, &mut state1));
-            let path = read_path.join().expect("can join")?;
-            let witness = witness.join().expect("can join")?;
-            eyre::Ok((path, witness))
-        })?;
-        Ok(PathAndWitness {
-            path,
-            witness,
-            positions,
-        })
-    }
-    pub fn build_trace_from_path_and_witness<N: Rep3NetworkExt>(
+    fn build_trace_from_path_and_witness<N: Rep3NetworkExt>(
         &self,
         net0: &N,
         path_and_witness: PathAndWitness,
@@ -277,30 +233,7 @@ impl LinearScanObliviousMap {
 
         Ok(dots)
     }
-    pub fn read_path_is_zero_many_mt<N: Rep3NetworkExt>(
-        &self,
-        key: Rep3RingShare<u32>,
-        net: &N,
-        state: &mut Rep3State,
-    ) -> eyre::Result<Vec<Rep3PrimeFieldShare<ark_bn254::Fr>>> {
-        let path_ohv = crate::rep3::is_zero_many_mt(self.find_path(key), net, state)?;
-        let mut dots_a = Vec::with_capacity(LINEAR_SCAN_TREE_DEPTH);
-        let mut start = 0;
-        for (layer, default) in izip!(self.layers.iter(), self.defaults.into_iter()) {
-            let end = start + layer.keys.len();
-            let dot = Self::dot(&path_ohv[start..end], &layer.values, default, state);
-            start = end;
-            dots_a.push(dot);
-        }
-        let dots_b = net.reshare_many(&dots_a)?;
-        let dots = izip!(dots_a, dots_b)
-            .map(|(a, b)| Rep3BigUintShare::<ark_bn254::Fr>::new(a.into(), b.into()))
-            .collect_vec();
 
-        let dots = conversion::b2a_many(&dots, net, state)?;
-
-        Ok(dots)
-    }
     #[expect(clippy::type_complexity)]
     pub fn read_merkle_witness<N: Rep3NetworkExt>(
         &self,

@@ -1,6 +1,5 @@
 use ark_ff::UniformRand as _;
 use clap::Parser;
-use co_noir_to_r1cs::noir::{r1cs, ultrahonk};
 use eyre::{Context, eyre};
 use figment::{
     Figment,
@@ -14,18 +13,13 @@ use mpc_net::{
     Network,
     tcp::{NetworkConfig, TcpNetwork},
 };
-use oblivious_linear_scan_map::{
-    LinearScanObliviousMap,
-    plain::LinearScanMap,
-    read::{PathAndWitness, ReadWithTrace},
-};
+use oblivious_linear_scan_map::{LinearScanObliviousMap, plain::LinearScanMap};
 use rand::{CryptoRng, Rng, SeedableRng};
 use rand_chacha::ChaCha12Rng;
 use serde::{Deserialize, Serialize};
 use std::{
     path::PathBuf,
     process::ExitCode,
-    sync::Arc,
     thread::sleep,
     time::{Duration, Instant},
 };
@@ -55,7 +49,7 @@ pub struct Cli {
 /// Config
 #[derive(Debug, Deserialize)]
 pub struct Config {
-    /// The number of testruns
+    /// The number of test runs
     pub runs: usize,
     /// The seed for the RNG
     pub seed: u64,
@@ -169,6 +163,11 @@ fn main() -> eyre::Result<ExitCode> {
     let cli = Cli::parse();
     let config = Config::parse(cli).context("while parsing config")?;
 
+    // install tracing for party ID 0
+    if config.network.my_id == 0 {
+        install_tracing();
+    }
+
     let mut seed = [0u8; 32];
     seed[0..8].copy_from_slice(&config.seed.to_le_bytes());
     let mut rng = ChaCha12Rng::from_seed(seed);
@@ -190,7 +189,7 @@ fn benchmarks<R: Rng + CryptoRng>(config: &Config, rng: &mut R) -> eyre::Result<
     let r = rep3::share_field_element(ark_bn254::Fr::rand(rng), rng)[config.network.my_id];
 
     tracing::info!("Sharing Map");
-    let [map0, map1, map2] = map.share(rng);
+    let [map0, map1, map2] = map.share(rng)?;
     let map = match config.network.my_id {
         0 => map0,
         1 => map1,
@@ -199,499 +198,23 @@ fn benchmarks<R: Rng + CryptoRng>(config: &Config, rng: &mut R) -> eyre::Result<
     };
 
     tracing::info!("Starting benchmarks");
-    let path_and_witness = read_path_and_witness(&map, used_key, config)?;
-    read_path_and_witness_and_mr(&map, used_key, config)?;
-    read_path_and_witness_dot_mr(&map, used_key, config)?;
-
-    let read_with_trace = read_poseidon_hashes(&map, path_and_witness, r, config)?;
-    read_proof(&map, read_with_trace, config, rng)?;
-    read_e2e(&map, used_key, r, config, rng)?;
+    read(&map, used_key, r, config)?;
     // insert(&map, unused_key, config, rng)?;
     // update(map, config, rng)?;
 
     Ok(ExitCode::SUCCESS)
 }
 
-fn read_path_and_witness(
+fn read(
     map: &LinearScanObliviousMap,
     key: Rep3RingShare<u32>,
-    config: &Config,
-) -> eyre::Result<PathAndWitness> {
-    let mut times = Vec::with_capacity(config.runs);
-    let mut send_receive_prev = Vec::with_capacity(config.runs);
-    let mut send_receive_next = Vec::with_capacity(config.runs);
-
-    // connect to network
-    let [net0, net1] = TcpNetwork::networks::<2>(config.network.to_owned())?;
-    if net0.id() == 0 {
-        install_tracing();
-    }
-    // init MPC protocol
-    let mut protocol = Rep3State::new(&net0, A2BType::default())?;
-    let mut path_and_witness = PathAndWitness::default();
-
-    for _ in 0..config.runs {
-        let stats_before0 = net0.get_connection_stats();
-        let stats_before1 = net1.get_connection_stats();
-
-        let start = Instant::now();
-        path_and_witness = map.read_path_and_witness(key, &net0, &net1, &mut protocol)?;
-        let duration = start.elapsed().as_micros() as f64;
-        times.push(duration);
-
-        let stats_after0 = net0.get_connection_stats();
-        let stats_after1 = net1.get_connection_stats();
-        let mut stats0 = stats_after0.get_diff_to(&stats_before0);
-        let stats1 = stats_after1.get_diff_to(&stats_before1);
-        for (key, (x, y)) in stats1 {
-            stats0
-                .entry(key)
-                .and_modify(|(ax, ay)| {
-                    *ax += x;
-                    *ay += y;
-                })
-                .or_insert((x, y));
-        }
-
-        send_receive_prev.push((
-            stats0
-                .get(&(protocol.id.prev() as usize))
-                .expect("invalid party id in stats")
-                .0,
-            stats0
-                .get(&(protocol.id.prev() as usize))
-                .expect("invalid party id in stats")
-                .1,
-        ));
-        send_receive_next.push((
-            stats0
-                .get(&(protocol.id.next() as usize))
-                .expect("invalid party id in stats")
-                .0,
-            stats0
-                .get(&(protocol.id.next() as usize))
-                .expect("invalid party id in stats")
-                .1,
-        ));
-    }
-
-    sleep(SLEEP);
-    print_runtimes(
-        times,
-        config.network.my_id,
-        &format!(
-            "Read (d={}, n={})",
-            "Get Path And Witness", config.num_items
-        ),
-    );
-    print_data(
-        send_receive_next,
-        config.network.my_id,
-        protocol.id.next() as usize,
-        &format!(
-            "Read (d={}, n={})",
-            "Get Path And Witness", config.num_items
-        ),
-    );
-    print_data(
-        send_receive_prev,
-        config.network.my_id,
-        protocol.id.prev() as usize,
-        &format!(
-            "Read (d={}, n={})",
-            "Get Path And Witness", config.num_items
-        ),
-    );
-
-    Ok(path_and_witness)
-}
-
-fn read_path_and_witness_and_mr(
-    map: &LinearScanObliviousMap,
-    key: Rep3RingShare<u32>,
-    config: &Config,
-) -> eyre::Result<()> {
-    let mut times = Vec::with_capacity(config.runs);
-    let mut send_receive_prev = Vec::with_capacity(config.runs);
-    let mut send_receive_next = Vec::with_capacity(config.runs);
-
-    // connect to network
-    let [net0, net1] = TcpNetwork::networks::<2>(config.network.to_owned())?;
-    // init MPC protocol
-    let mut protocol = Rep3State::new(&net0, A2BType::default())?;
-
-    for _ in 0..config.runs {
-        let stats_before0 = net0.get_connection_stats();
-        let stats_before1 = net1.get_connection_stats();
-
-        let start = Instant::now();
-        map.read_path_and_witness_is_zero_mt(key, &net0, &net1, &mut protocol)?;
-        let duration = start.elapsed().as_micros() as f64;
-        times.push(duration);
-
-        let stats_after0 = net0.get_connection_stats();
-        let stats_after1 = net1.get_connection_stats();
-        let mut stats0 = stats_after0.get_diff_to(&stats_before0);
-        let stats1 = stats_after1.get_diff_to(&stats_before1);
-        for (key, (x, y)) in stats1 {
-            stats0
-                .entry(key)
-                .and_modify(|(ax, ay)| {
-                    *ax += x;
-                    *ay += y;
-                })
-                .or_insert((x, y));
-        }
-
-        send_receive_prev.push((
-            stats0
-                .get(&(protocol.id.prev() as usize))
-                .expect("invalid party id in stats")
-                .0,
-            stats0
-                .get(&(protocol.id.prev() as usize))
-                .expect("invalid party id in stats")
-                .1,
-        ));
-        send_receive_next.push((
-            stats0
-                .get(&(protocol.id.next() as usize))
-                .expect("invalid party id in stats")
-                .0,
-            stats0
-                .get(&(protocol.id.next() as usize))
-                .expect("invalid party id in stats")
-                .1,
-        ));
-    }
-
-    sleep(SLEEP);
-    print_runtimes(
-        times,
-        config.network.my_id,
-        &format!(
-            "Read (d={}, n={})",
-            "Get Path And Witness Is zero mt", config.num_items
-        ),
-    );
-    print_data(
-        send_receive_next,
-        config.network.my_id,
-        protocol.id.next() as usize,
-        &format!(
-            "Read (d={}, n={})",
-            "Get Path And Witness Is zero mt ", config.num_items
-        ),
-    );
-    print_data(
-        send_receive_prev,
-        config.network.my_id,
-        protocol.id.prev() as usize,
-        &format!(
-            "Read (d={}, n={})",
-            "Get Path And Witness  Is zero mt", config.num_items
-        ),
-    );
-    Ok(())
-}
-
-fn read_path_and_witness_dot_mr(
-    map: &LinearScanObliviousMap,
-    key: Rep3RingShare<u32>,
-    config: &Config,
-) -> eyre::Result<()> {
-    let mut times = Vec::with_capacity(config.runs);
-    let mut send_receive_prev = Vec::with_capacity(config.runs);
-    let mut send_receive_next = Vec::with_capacity(config.runs);
-
-    // connect to network
-    let [net0, net1] = TcpNetwork::networks::<2>(config.network.to_owned())?;
-    // init MPC protocol
-    let mut protocol = Rep3State::new(&net0, A2BType::default())?;
-
-    for _ in 0..config.runs {
-        let stats_before0 = net0.get_connection_stats();
-        let stats_before1 = net1.get_connection_stats();
-
-        let start = Instant::now();
-        map.read_path_and_witness_dot_mt(key, &net0, &net1, &mut protocol)?;
-        let duration = start.elapsed().as_micros() as f64;
-        times.push(duration);
-
-        let stats_after0 = net0.get_connection_stats();
-        let stats_after1 = net1.get_connection_stats();
-        let mut stats0 = stats_after0.get_diff_to(&stats_before0);
-        let stats1 = stats_after1.get_diff_to(&stats_before1);
-        for (key, (x, y)) in stats1 {
-            stats0
-                .entry(key)
-                .and_modify(|(ax, ay)| {
-                    *ax += x;
-                    *ay += y;
-                })
-                .or_insert((x, y));
-        }
-
-        send_receive_prev.push((
-            stats0
-                .get(&(protocol.id.prev() as usize))
-                .expect("invalid party id in stats")
-                .0,
-            stats0
-                .get(&(protocol.id.prev() as usize))
-                .expect("invalid party id in stats")
-                .1,
-        ));
-        send_receive_next.push((
-            stats0
-                .get(&(protocol.id.next() as usize))
-                .expect("invalid party id in stats")
-                .0,
-            stats0
-                .get(&(protocol.id.next() as usize))
-                .expect("invalid party id in stats")
-                .1,
-        ));
-    }
-
-    sleep(SLEEP);
-    print_runtimes(
-        times,
-        config.network.my_id,
-        &format!(
-            "Read (d={}, n={})",
-            "Get Path And Witness dots mt", config.num_items
-        ),
-    );
-    print_data(
-        send_receive_next,
-        config.network.my_id,
-        protocol.id.next() as usize,
-        &format!(
-            "Read (d={}, n={})",
-            "Get Path And Witness dots mt ", config.num_items
-        ),
-    );
-    print_data(
-        send_receive_prev,
-        config.network.my_id,
-        protocol.id.prev() as usize,
-        &format!(
-            "Read (d={}, n={})",
-            "Get Path And Witness  Is zero mt", config.num_items
-        ),
-    );
-    Ok(())
-}
-fn read_poseidon_hashes(
-    map: &LinearScanObliviousMap,
-    path_and_witness: PathAndWitness,
     randomness: Rep3PrimeFieldShare<ark_bn254::Fr>,
     config: &Config,
-) -> eyre::Result<ReadWithTrace> {
-    let mut times = Vec::with_capacity(config.runs);
-    let mut send_receive_prev = Vec::with_capacity(config.runs);
-    let mut send_receive_next = Vec::with_capacity(config.runs);
-
-    // connect to network
-    let [net0, net1] = TcpNetwork::networks::<2>(config.network.to_owned())?;
-    // init MPC protocol
-    let mut protocol = Rep3State::new(&net0, A2BType::default())?;
-    let mut read_with_trace = ReadWithTrace::default();
-
-    for _ in 0..config.runs {
-        let stats_before0 = net0.get_connection_stats();
-        let stats_before1 = net1.get_connection_stats();
-
-        let path_and_witness = path_and_witness.clone();
-        let start = Instant::now();
-        read_with_trace = map.build_trace_from_path_and_witness(
-            &net0,
-            path_and_witness,
-            randomness,
-            &mut protocol,
-        )?;
-        let duration = start.elapsed().as_micros() as f64;
-        times.push(duration);
-
-        let stats_after0 = net0.get_connection_stats();
-        let stats_after1 = net1.get_connection_stats();
-        let mut stats0 = stats_after0.get_diff_to(&stats_before0);
-        let stats1 = stats_after1.get_diff_to(&stats_before1);
-        for (key, (x, y)) in stats1 {
-            stats0
-                .entry(key)
-                .and_modify(|(ax, ay)| {
-                    *ax += x;
-                    *ay += y;
-                })
-                .or_insert((x, y));
-        }
-
-        send_receive_prev.push((
-            stats0
-                .get(&(protocol.id.prev() as usize))
-                .expect("invalid party id in stats")
-                .0,
-            stats0
-                .get(&(protocol.id.prev() as usize))
-                .expect("invalid party id in stats")
-                .1,
-        ));
-        send_receive_next.push((
-            stats0
-                .get(&(protocol.id.next() as usize))
-                .expect("invalid party id in stats")
-                .0,
-            stats0
-                .get(&(protocol.id.next() as usize))
-                .expect("invalid party id in stats")
-                .1,
-        ));
-    }
-
-    sleep(SLEEP);
-    print_runtimes(
-        times,
-        config.network.my_id,
-        &format!("Read (d={}, n={})", "Poseidon2 for trace", config.num_items),
-    );
-    print_data(
-        send_receive_next,
-        config.network.my_id,
-        protocol.id.next() as usize,
-        &format!("Read (d={}, n={})", "Poseidon2 for trace", config.num_items),
-    );
-    print_data(
-        send_receive_prev,
-        config.network.my_id,
-        protocol.id.prev() as usize,
-        &format!("Read (d={}, n={})", "Poseidon2 for trace", config.num_items),
-    );
-
-    Ok(read_with_trace)
-}
-
-fn read_proof<R: Rng + CryptoRng>(
-    map: &LinearScanObliviousMap,
-    read_with_trace: ReadWithTrace,
-    config: &Config,
-    rng: &mut R,
 ) -> eyre::Result<ExitCode> {
     let mut times = Vec::with_capacity(config.runs);
     let mut send_receive_prev = Vec::with_capacity(config.runs);
     let mut send_receive_next = Vec::with_capacity(config.runs);
 
-    let root = std::env!("CARGO_MANIFEST_DIR");
-    let read_program = ultrahonk::get_program_artifact(format!(
-        "{root}/noir/compiled_circuits/oblivious_map_read.json"
-    ))?;
-    let (proof_schema, pk, cs) = r1cs::setup_r1cs(read_program, rng)?;
-    let proof_schema = Arc::new(proof_schema);
-    let pk = Arc::new(pk);
-    let cs = Arc::new(cs);
-
-    // connect to network
-    let [net0, net1] = TcpNetwork::networks::<2>(config.network.to_owned())?;
-    // init MPC protocol
-    let mut protocol = Rep3State::new(&net0, A2BType::default())?;
-
-    for _ in 0..config.runs {
-        let stats_before0 = net0.get_connection_stats();
-        let stats_before1 = net1.get_connection_stats();
-
-        let read_with_trace = read_with_trace.clone();
-        let start = Instant::now();
-        map.read_r1cs_proof(
-            &net0,
-            &net1,
-            read_with_trace,
-            &mut protocol,
-            &proof_schema,
-            &cs,
-            &pk,
-        )?;
-        let duration = start.elapsed().as_micros() as f64;
-        times.push(duration);
-
-        let stats_after0 = net0.get_connection_stats();
-        let stats_after1 = net1.get_connection_stats();
-        let mut stats0 = stats_after0.get_diff_to(&stats_before0);
-        let stats1 = stats_after1.get_diff_to(&stats_before1);
-        for (key, (x, y)) in stats1 {
-            stats0
-                .entry(key)
-                .and_modify(|(ax, ay)| {
-                    *ax += x;
-                    *ay += y;
-                })
-                .or_insert((x, y));
-        }
-
-        send_receive_prev.push((
-            stats0
-                .get(&(protocol.id.prev() as usize))
-                .expect("invalid party id in stats")
-                .0,
-            stats0
-                .get(&(protocol.id.prev() as usize))
-                .expect("invalid party id in stats")
-                .1,
-        ));
-        send_receive_next.push((
-            stats0
-                .get(&(protocol.id.next() as usize))
-                .expect("invalid party id in stats")
-                .0,
-            stats0
-                .get(&(protocol.id.next() as usize))
-                .expect("invalid party id in stats")
-                .1,
-        ));
-    }
-
-    sleep(SLEEP);
-    print_runtimes(
-        times,
-        config.network.my_id,
-        &format!("Read (d={}, n={})", "Groth16 Proof", config.num_items),
-    );
-    print_data(
-        send_receive_next,
-        config.network.my_id,
-        protocol.id.next() as usize,
-        &format!("Read (d={}, n={})", "Groth16 Proof", config.num_items),
-    );
-    print_data(
-        send_receive_prev,
-        config.network.my_id,
-        protocol.id.prev() as usize,
-        &format!("Read (d={}, n={})", "Groth16 Proof", config.num_items),
-    );
-
-    Ok(ExitCode::SUCCESS)
-}
-
-fn read_e2e<R: Rng + CryptoRng>(
-    map: &LinearScanObliviousMap,
-    key: Rep3RingShare<u32>,
-    randomness: Rep3PrimeFieldShare<ark_bn254::Fr>,
-    config: &Config,
-    rng: &mut R,
-) -> eyre::Result<ExitCode> {
-    let mut times = Vec::with_capacity(config.runs);
-    let mut send_receive_prev = Vec::with_capacity(config.runs);
-    let mut send_receive_next = Vec::with_capacity(config.runs);
-
-    let root = std::env!("CARGO_MANIFEST_DIR");
-    let read_program = ultrahonk::get_program_artifact(format!(
-        "{root}/noir/compiled_circuits/oblivious_map_read.json"
-    ))?;
-    let (proof_schema, pk, cs) = r1cs::setup_r1cs(read_program, rng)?;
-    let proof_schema = Arc::new(proof_schema);
-    let pk = Arc::new(pk);
-    let cs = Arc::new(cs);
-
     // connect to network
     let [net0, net1] = TcpNetwork::networks::<2>(config.network.to_owned())?;
     // init MPC protocol
@@ -702,16 +225,7 @@ fn read_e2e<R: Rng + CryptoRng>(
         let stats_before1 = net1.get_connection_stats();
 
         let start = Instant::now();
-        map.read_e2e(
-            key,
-            &net0,
-            &net1,
-            randomness,
-            &mut protocol,
-            &proof_schema,
-            &cs,
-            &pk,
-        )?;
+        map.read(key, &net0, &net1, randomness, &mut protocol)?;
         let duration = start.elapsed().as_micros() as f64;
         times.push(duration);
 

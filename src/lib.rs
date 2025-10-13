@@ -17,7 +17,8 @@ use mpc_core::{
 };
 use mpc_net::Network;
 
-use crate::rep3::Rep3BigIntShare;
+use crate::{groth16::Groth16Material, rep3::Rep3BigIntShare};
+mod groth16;
 mod insert;
 pub mod plain;
 pub mod read;
@@ -53,20 +54,18 @@ pub struct LinearScanObliviousMap {
     total_count: usize,
     defaults: [BigInteger256; LINEAR_SCAN_TREE_DEPTH],
     root: ark_bn254::Fr,
-}
-
-impl Default for LinearScanObliviousMap {
-    fn default() -> Self {
-        Self::new()
-    }
+    read_groth16: Groth16Material,
 }
 
 impl LinearScanObliviousMap {
-    pub fn new() -> Self {
-        Self::with_default_value(ark_bn254::Fr::zero())
+    pub fn new(read_groth16: Groth16Material) -> Self {
+        Self::with_default_value(ark_bn254::Fr::zero(), read_groth16)
     }
 
-    pub fn with_default_value(mut default_value: ark_bn254::Fr) -> Self {
+    pub fn with_default_value(
+        mut default_value: ark_bn254::Fr,
+        read_groth16: Groth16Material,
+    ) -> Self {
         let poseidon2 = Poseidon2::<ark_bn254::Fr, 2, 5>::default();
         let defaults = std::array::from_fn(|_| {
             let prev = default_value.into_bigint();
@@ -79,6 +78,7 @@ impl LinearScanObliviousMap {
             total_count: 0,
             defaults,
             root: default_value,
+            read_groth16,
         }
     }
 
@@ -260,309 +260,45 @@ impl LinearScanObliviousMap {
 
 #[cfg(test)]
 mod tests {
-    use ark_ff::UniformRand as _;
     use co_noir_to_r1cs::noir::{r1cs, ultrahonk};
-    use itertools::izip;
     use mpc_core::protocols::{
         rep3::{self, Rep3State, conversion::A2BType},
         rep3_ring::{self, ring::ring_impl::RingElement},
     };
     use mpc_net::local::LocalNetwork;
-    use std::{str::FromStr, sync::Arc};
+    use std::str::FromStr;
 
-    use crate::LinearScanObliviousMap;
+    use crate::{LinearScanObliviousMap, groth16::Groth16Material};
 
     const DEFAULT_ROOT_BN254_FR: &str =
         "20656661903863297823367476705363945647184478890034741500819882513030138045548";
 
     #[test]
-    fn defaults_correct() {
-        let is_root = LinearScanObliviousMap::new().root;
+    fn defaults_correct() -> eyre::Result<()> {
+        let root = std::env!("CARGO_MANIFEST_DIR");
+        let read_program = ultrahonk::get_program_artifact(format!(
+            "{root}/noir/compiled_circuits/oblivious_map_read.json"
+        ))?;
+        let (proof_schema, pk, cs) = r1cs::setup_r1cs(read_program, &mut rand::thread_rng())?;
+
+        let is_root = LinearScanObliviousMap::new(Groth16Material::new(proof_schema, cs, pk)).root;
         let should_root = ark_bn254::Fr::from_str(DEFAULT_ROOT_BN254_FR).expect("works");
         assert_eq!(is_root, should_root);
+        Ok(())
     }
 
     #[test]
-    fn read_empty_map() {
+    fn read_empty_map() -> eyre::Result<()> {
         let mut rng = rand::thread_rng();
 
         // generate a random key
         let key = RingElement(rand::random::<u32>());
+        let randomness_commitment = ark_bn254::Fr::from(rand::random::<u128>());
 
         let [key_share0, key_share1, key_share2] =
             rep3_ring::share_ring_element_binary(key, &mut rng);
 
-        // need two networks
-        let [n0, n1, n2] = LocalNetwork::new_3_parties();
-        let [n3, n4, n5] = LocalNetwork::new_3_parties();
-        let random_default_value = ark_bn254::Fr::from(rand::random::<u128>());
-
-        let [res0, res1, res2] = std::thread::scope(|s| {
-            let res0 = s.spawn(|| {
-                let map = LinearScanObliviousMap::with_default_value(random_default_value);
-                let mut state = Rep3State::new(&n0, A2BType::Direct).expect("works");
-                let read_value = map
-                    .read_path_and_witness(key_share0, &n0, &n3, &mut state)?
-                    .path[0];
-                eyre::Ok(read_value)
-            });
-
-            let res1 = s.spawn(|| {
-                let map = LinearScanObliviousMap::with_default_value(random_default_value);
-                let mut state = Rep3State::new(&n1, A2BType::Direct).expect("works");
-                let read_value = map
-                    .read_path_and_witness(key_share1, &n1, &n4, &mut state)?
-                    .path[0];
-                eyre::Ok(read_value)
-            });
-
-            let res2 = s.spawn(|| {
-                let map = LinearScanObliviousMap::with_default_value(random_default_value);
-                let mut state = Rep3State::new(&n2, A2BType::Direct).expect("works");
-                let read_value = map
-                    .read_path_and_witness(key_share2, &n2, &n5, &mut state)?
-                    .path[0];
-                eyre::Ok(read_value)
-            });
-            let res0 = res0.join().expect("can join").expect("did work");
-            let res1 = res1.join().expect("can join").expect("did work");
-            let res2 = res2.join().expect("can join").expect("did work");
-            [res0, res1, res2]
-        });
-
-        let result = res0 + res1 + res2;
-        assert_eq!(result.a, random_default_value);
-    }
-
-    #[test]
-    fn insert_then_read() {
-        const TEST_SUITE: usize = 100;
-        let mut rng = rand::thread_rng();
-
-        // generate a random key/values
-        let mut keys = Vec::with_capacity(TEST_SUITE);
-        let mut values = Vec::with_capacity(TEST_SUITE);
-        for _ in 0..TEST_SUITE {
-            let mut key = rand::random::<RingElement<u32>>();
-            while keys.contains(&key) {
-                key = rand::random::<RingElement<u32>>();
-            }
-            keys.push(key);
-            values.push(ark_bn254::Fr::from(rand::random::<u128>()));
-        }
-
-        let [key_share0, key_share1, key_share2] =
-            rep3_ring::share_ring_elements_binary(&keys, &mut rng);
-        let [value_share0, value_share1, value_share2] =
-            rep3::share_field_elements(&values, &mut rng);
-
-        // need two networks
-        let [n0, n1, n2] = LocalNetwork::new_3_parties();
-        let [n3, n4, n5] = LocalNetwork::new_3_parties();
-        let random_default_value = ark_bn254::Fr::from(rand::random::<u128>());
-
-        let [res0, res1, res2] = std::thread::scope(|s| {
-            let res0 = s.spawn(|| {
-                let mut map = LinearScanObliviousMap::with_default_value(random_default_value);
-                let mut state = Rep3State::new(&n0, A2BType::Direct).expect("works");
-                let mut reads = Vec::with_capacity(TEST_SUITE);
-                let mut defaults = Vec::with_capacity(TEST_SUITE);
-
-                for (k, v) in izip!(key_share0, value_share0) {
-                    // read first on key before insert
-                    defaults.push(map.read_path_and_witness(k, &n0, &n3, &mut state)?.path[0]);
-                    map.insert(k, v, &n0, &n3, &mut state)?;
-                    reads.push(map.read_path_and_witness(k, &n0, &n3, &mut state)?.path[0]);
-                }
-                eyre::Ok((reads, defaults))
-            });
-
-            let res1 = s.spawn(|| {
-                let mut map = LinearScanObliviousMap::with_default_value(random_default_value);
-                let mut state = Rep3State::new(&n1, A2BType::Direct).expect("works");
-                let mut reads = Vec::with_capacity(TEST_SUITE);
-                let mut defaults = Vec::with_capacity(TEST_SUITE);
-
-                for (k, v) in izip!(key_share1, value_share1) {
-                    // read first on key before insert
-                    defaults.push(map.read_path_and_witness(k, &n1, &n4, &mut state)?.path[0]);
-                    map.insert(k, v, &n1, &n4, &mut state)?;
-                    reads.push(map.read_path_and_witness(k, &n1, &n4, &mut state)?.path[0]);
-                }
-                eyre::Ok((reads, defaults))
-            });
-
-            let res2 = s.spawn(|| {
-                let mut map = LinearScanObliviousMap::with_default_value(random_default_value);
-                let mut state = Rep3State::new(&n2, A2BType::Direct).expect("works");
-                let mut reads = Vec::with_capacity(TEST_SUITE);
-                let mut defaults = Vec::with_capacity(TEST_SUITE);
-
-                for (k, v) in izip!(key_share2, value_share2) {
-                    // read first on key before insert
-                    defaults.push(map.read_path_and_witness(k, &n2, &n5, &mut state)?.path[0]);
-                    map.insert(k, v, &n2, &n5, &mut state)?;
-                    reads.push(map.read_path_and_witness(k, &n2, &n5, &mut state)?.path[0]);
-                }
-                eyre::Ok((reads, defaults))
-            });
-            let res0 = res0.join().expect("can join").expect("did work");
-            let res1 = res1.join().expect("can join").expect("did work");
-            let res2 = res2.join().expect("can join").expect("did work");
-            [res0, res1, res2]
-        });
-
-        let (reads0, defaults0) = res0;
-        let (reads1, defaults1) = res1;
-        let (reads2, defaults2) = res2;
-
-        for (d0, d1, d2) in izip!(defaults0, defaults1, defaults2) {
-            assert_eq!((d0 + d1 + d2).a, random_default_value);
-        }
-
-        for (r0, r1, r2, should) in izip!(reads0, reads1, reads2, values) {
-            assert_eq!((r0 + r1 + r2).a, should);
-        }
-    }
-
-    #[test]
-    fn insert_update_then_read() {
-        const TEST_SUITE: usize = 100;
-        let mut rng = rand::thread_rng();
-
-        // generate a random key/values
-        let mut keys = Vec::with_capacity(TEST_SUITE);
-        let mut values = Vec::with_capacity(TEST_SUITE);
-        let mut updates = Vec::with_capacity(TEST_SUITE);
-        for _ in 0..TEST_SUITE {
-            let mut key = rand::random::<RingElement<u32>>();
-            while keys.contains(&key) {
-                key = rand::random::<RingElement<u32>>();
-            }
-            keys.push(key);
-            values.push(ark_bn254::Fr::from(rand::random::<u128>()));
-            updates.push(ark_bn254::Fr::from(rand::random::<u128>()));
-        }
-
-        let [key_share0, key_share1, key_share2] =
-            rep3_ring::share_ring_elements_binary(&keys, &mut rng);
-        let [value_share0, value_share1, value_share2] =
-            rep3::share_field_elements(&values, &mut rng);
-        let [update_share0, update_share1, update_share2] =
-            rep3::share_field_elements(&updates, &mut rng);
-        // need two networks
-        let [n0, n1, n2] = LocalNetwork::new_3_parties();
-        let [n3, n4, n5] = LocalNetwork::new_3_parties();
-        let random_default_value = ark_bn254::Fr::from(rand::random::<u128>());
-
-        let [res0, res1, res2] = std::thread::scope(|s| {
-            let res0 = s.spawn(|| {
-                let mut map = LinearScanObliviousMap::with_default_value(random_default_value);
-                let mut state = Rep3State::new(&n0, A2BType::Direct).expect("works");
-                let mut reads = Vec::with_capacity(TEST_SUITE);
-                let mut path_checks = Vec::with_capacity(TEST_SUITE * 3);
-
-                for (k, v, u) in izip!(key_share0, value_share0, update_share0) {
-                    // insert
-                    let insert_path = map.insert(k, v, &n0, &n3, &mut state)?;
-                    path_checks.push(map.verify_path(v, &insert_path, &n0, &mut state)?);
-
-                    // update
-                    let update_path = map.update(k, u, &n0, &n3, &mut state)?;
-                    path_checks.push(map.verify_path(u, &update_path, &n0, &mut state)?);
-
-                    // verify
-                    let read_value = map.read_path_and_witness(k, &n0, &n3, &mut state)?.path[0];
-                    reads.push(read_value);
-                }
-                eyre::Ok((reads, path_checks))
-            });
-
-            let res1 = s.spawn(|| {
-                let mut map = LinearScanObliviousMap::with_default_value(random_default_value);
-                let mut state = Rep3State::new(&n1, A2BType::Direct).expect("works");
-                let mut reads = Vec::with_capacity(TEST_SUITE);
-                let mut path_checks = Vec::with_capacity(TEST_SUITE * 3);
-
-                for (k, v, u) in izip!(key_share1, value_share1, update_share1) {
-                    // insert
-                    let insert_path = map.insert(k, v, &n1, &n4, &mut state)?;
-                    path_checks.push(map.verify_path(v, &insert_path, &n1, &mut state)?);
-
-                    // update
-                    let update_path = map.update(k, u, &n1, &n4, &mut state)?;
-                    path_checks.push(map.verify_path(u, &update_path, &n1, &mut state)?);
-
-                    // verify
-                    let read_value = map.read_path_and_witness(k, &n1, &n4, &mut state)?.path[0];
-                    reads.push(read_value);
-                }
-                eyre::Ok((reads, path_checks))
-            });
-
-            let res2 = s.spawn(|| {
-                let mut map = LinearScanObliviousMap::with_default_value(random_default_value);
-                let mut state = Rep3State::new(&n2, A2BType::Direct).expect("works");
-                let mut reads = Vec::with_capacity(TEST_SUITE);
-                let mut path_checks = Vec::with_capacity(TEST_SUITE * 3);
-
-                for (k, v, u) in izip!(key_share2, value_share2, update_share2) {
-                    // insert
-                    let insert_path = map.insert(k, v, &n2, &n5, &mut state)?;
-                    path_checks.push(map.verify_path(v, &insert_path, &n2, &mut state)?);
-
-                    // update
-                    let update_path = map.update(k, u, &n2, &n5, &mut state)?;
-                    path_checks.push(map.verify_path(u, &update_path, &n2, &mut state)?);
-
-                    // verify
-                    let read_value = map.read_path_and_witness(k, &n2, &n5, &mut state)?.path[0];
-                    reads.push(read_value);
-                }
-                eyre::Ok((reads, path_checks))
-            });
-            let res0 = res0.join().expect("can join").expect("did work");
-            let res1 = res1.join().expect("can join").expect("did work");
-            let res2 = res2.join().expect("can join").expect("did work");
-            [res0, res1, res2]
-        });
-
-        let (reads0, checks0) = res0;
-        let (reads1, checks1) = res1;
-        let (reads2, checks2) = res2;
-
-        for (r0, r1, r2, should) in izip!(reads0, reads1, reads2, updates) {
-            assert_eq!((r0 + r1 + r2).a, should);
-        }
-
-        for (r0, r1, r2) in izip!(checks0, checks1, checks2) {
-            assert!((r0 + r1 + r2).a.convert().convert());
-        }
-    }
-
-    #[test]
-    pub fn insert_then_read_proof() {
-        const TEST_SUITE: usize = 1;
-        let mut rng = rand::thread_rng();
-
-        // generate a random key/values
-        let mut keys = Vec::with_capacity(TEST_SUITE);
-        let mut values = Vec::with_capacity(TEST_SUITE);
-        for _ in 0..TEST_SUITE {
-            let mut key = rand::random::<RingElement<u32>>();
-            while keys.contains(&key) {
-                key = rand::random::<RingElement<u32>>();
-            }
-            keys.push(key);
-            values.push(ark_bn254::Fr::from(rand::random::<u128>()));
-        }
-
-        let [key_share0, key_share1, key_share2] =
-            rep3_ring::share_ring_elements_binary(&keys, &mut rng);
-        let [value_share0, value_share1, value_share2] =
-            rep3::share_field_elements(&values, &mut rng);
-        // just use the same random value, doesn't really matter
-        let [r0, r1, r2] = rep3::share_field_element(ark_bn254::Fr::rand(&mut rng), &mut rng);
+        let [r0, r1, r2] = rep3::share_field_element(randomness_commitment, &mut rng);
 
         // need two networks
         let [n0, n1, n2] = LocalNetwork::new_3_parties();
@@ -572,78 +308,39 @@ mod tests {
         let root = std::env!("CARGO_MANIFEST_DIR");
         let read_program = ultrahonk::get_program_artifact(format!(
             "{root}/noir/compiled_circuits/oblivious_map_read.json"
-        ))
-        .unwrap();
-        let (proof_schema, pk, cs) = r1cs::setup_r1cs(read_program, &mut rng).unwrap();
-        let proof_schema = Arc::new(proof_schema);
-        let pk = Arc::new(pk);
-        let cs = Arc::new(cs);
+        ))?;
+        let (proof_schema, pk, cs) = r1cs::setup_r1cs(read_program, &mut rand::thread_rng())?;
+        let read_material0 = Groth16Material::new(proof_schema, cs, pk.clone());
+        let read_material1 = read_material0.clone();
+        let read_material2 = read_material0.clone();
 
         let [res0, res1, res2] = std::thread::scope(|s| {
             let res0 = s.spawn(|| {
-                let mut map = LinearScanObliviousMap::with_default_value(random_default_value);
+                let map = LinearScanObliviousMap::with_default_value(
+                    random_default_value,
+                    read_material0,
+                );
                 let mut state = Rep3State::new(&n0, A2BType::Direct).expect("works");
-                let mut reads = Vec::with_capacity(TEST_SUITE);
-
-                for (k, v) in izip!(key_share0, value_share0) {
-                    // read first on key before insert
-                    map.insert(k, v, &n0, &n3, &mut state)?;
-                    reads.push(map.read_e2e(
-                        k,
-                        &n0,
-                        &n3,
-                        r0,
-                        &mut state,
-                        &proof_schema,
-                        &cs,
-                        &pk,
-                    )?);
-                }
-                eyre::Ok(reads)
+                let read_value = map.read(key_share0, &n0, &n3, r0, &mut state)?;
+                eyre::Ok(read_value)
             });
 
             let res1 = s.spawn(|| {
-                let mut map = LinearScanObliviousMap::with_default_value(random_default_value);
+                let map = LinearScanObliviousMap::with_default_value(
+                    random_default_value,
+                    read_material1,
+                );
                 let mut state = Rep3State::new(&n1, A2BType::Direct).expect("works");
-                let mut reads = Vec::with_capacity(TEST_SUITE);
-
-                for (k, v) in izip!(key_share1, value_share1) {
-                    // read first on key before insert
-                    map.insert(k, v, &n1, &n4, &mut state)?;
-                    reads.push(map.read_e2e(
-                        k,
-                        &n1,
-                        &n4,
-                        r1,
-                        &mut state,
-                        &proof_schema,
-                        &cs,
-                        &pk,
-                    )?);
-                }
-                eyre::Ok(reads)
+                map.read(key_share1, &n1, &n4, r1, &mut state)
             });
 
             let res2 = s.spawn(|| {
-                let mut map = LinearScanObliviousMap::with_default_value(random_default_value);
+                let map = LinearScanObliviousMap::with_default_value(
+                    random_default_value,
+                    read_material2,
+                );
                 let mut state = Rep3State::new(&n2, A2BType::Direct).expect("works");
-                let mut reads = Vec::with_capacity(TEST_SUITE);
-
-                for (k, v) in izip!(key_share2, value_share2) {
-                    // read first on key before insert
-                    map.insert(k, v, &n2, &n5, &mut state)?;
-                    reads.push(map.read_e2e(
-                        k,
-                        &n2,
-                        &n5,
-                        r2,
-                        &mut state,
-                        &proof_schema,
-                        &cs,
-                        &pk,
-                    )?);
-                }
-                eyre::Ok(reads)
+                map.read(key_share2, &n2, &n5, r2, &mut state)
             });
             let res0 = res0.join().expect("can join").expect("did work");
             let res1 = res1.join().expect("can join").expect("did work");
@@ -651,23 +348,351 @@ mod tests {
             [res0, res1, res2]
         });
 
-        for (res0, res1, res2, should) in izip!(res0, res1, res2, values) {
-            let (reads0, proof0, public_input0) = res0;
-            let (reads1, proof1, public_input1) = res1;
-            let (reads2, proof2, public_input2) = res2;
-            assert!(
-                r1cs::verify(&pk.vk, &proof0, &public_input0).unwrap(),
-                "proof verifies"
-            );
-            assert!(
-                r1cs::verify(&pk.vk, &proof1, &public_input1).unwrap(),
-                "proof verifies"
-            );
-            assert!(
-                r1cs::verify(&pk.vk, &proof2, &public_input2).unwrap(),
-                "proof verifies"
-            );
-            assert_eq!((reads0 + reads1 + reads2).a, should);
-        }
+        let read_value = (res0.read + res1.read + res2.read).a;
+        assert_eq!(read_value, random_default_value);
+
+        // verify the proofs
+        assert!(r1cs::verify(&pk.vk, &res0.proof, &res0.public_inputs)?);
+        assert!(r1cs::verify(&pk.vk, &res1.proof, &res1.public_inputs)?);
+        assert!(r1cs::verify(&pk.vk, &res2.proof, &res2.public_inputs)?);
+
+        Ok(())
     }
+
+    // #[test]
+    // fn insert_then_read() {
+    //     const TEST_SUITE: usize = 100;
+    //     let mut rng = rand::thread_rng();
+
+    //     // generate a random key/values
+    //     let mut keys = Vec::with_capacity(TEST_SUITE);
+    //     let mut values = Vec::with_capacity(TEST_SUITE);
+    //     for _ in 0..TEST_SUITE {
+    //         let mut key = rand::random::<RingElement<u32>>();
+    //         while keys.contains(&key) {
+    //             key = rand::random::<RingElement<u32>>();
+    //         }
+    //         keys.push(key);
+    //         values.push(ark_bn254::Fr::from(rand::random::<u128>()));
+    //     }
+
+    //     let [key_share0, key_share1, key_share2] =
+    //         rep3_ring::share_ring_elements_binary(&keys, &mut rng);
+    //     let [value_share0, value_share1, value_share2] =
+    //         rep3::share_field_elements(&values, &mut rng);
+
+    //     // need two networks
+    //     let [n0, n1, n2] = LocalNetwork::new_3_parties();
+    //     let [n3, n4, n5] = LocalNetwork::new_3_parties();
+    //     let random_default_value = ark_bn254::Fr::from(rand::random::<u128>());
+
+    //     let [res0, res1, res2] = std::thread::scope(|s| {
+    //         let res0 = s.spawn(|| {
+    //             let mut map = LinearScanObliviousMap::with_default_value(random_default_value);
+    //             let mut state = Rep3State::new(&n0, A2BType::Direct).expect("works");
+    //             let mut reads = Vec::with_capacity(TEST_SUITE);
+    //             let mut defaults = Vec::with_capacity(TEST_SUITE);
+
+    //             for (k, v) in izip!(key_share0, value_share0) {
+    //                 // read first on key before insert
+    //                 defaults.push(map.read_path_and_witness(k, &n0, &n3, &mut state)?.path[0]);
+    //                 map.insert(k, v, &n0, &n3, &mut state)?;
+    //                 reads.push(map.read_path_and_witness(k, &n0, &n3, &mut state)?.path[0]);
+    //             }
+    //             eyre::Ok((reads, defaults))
+    //         });
+
+    //         let res1 = s.spawn(|| {
+    //             let mut map = LinearScanObliviousMap::with_default_value(random_default_value);
+    //             let mut state = Rep3State::new(&n1, A2BType::Direct).expect("works");
+    //             let mut reads = Vec::with_capacity(TEST_SUITE);
+    //             let mut defaults = Vec::with_capacity(TEST_SUITE);
+
+    //             for (k, v) in izip!(key_share1, value_share1) {
+    //                 // read first on key before insert
+    //                 defaults.push(map.read_path_and_witness(k, &n1, &n4, &mut state)?.path[0]);
+    //                 map.insert(k, v, &n1, &n4, &mut state)?;
+    //                 reads.push(map.read_path_and_witness(k, &n1, &n4, &mut state)?.path[0]);
+    //             }
+    //             eyre::Ok((reads, defaults))
+    //         });
+
+    //         let res2 = s.spawn(|| {
+    //             let mut map = LinearScanObliviousMap::with_default_value(random_default_value);
+    //             let mut state = Rep3State::new(&n2, A2BType::Direct).expect("works");
+    //             let mut reads = Vec::with_capacity(TEST_SUITE);
+    //             let mut defaults = Vec::with_capacity(TEST_SUITE);
+
+    //             for (k, v) in izip!(key_share2, value_share2) {
+    //                 // read first on key before insert
+    //                 defaults.push(map.read_path_and_witness(k, &n2, &n5, &mut state)?.path[0]);
+    //                 map.insert(k, v, &n2, &n5, &mut state)?;
+    //                 reads.push(map.read_path_and_witness(k, &n2, &n5, &mut state)?.path[0]);
+    //             }
+    //             eyre::Ok((reads, defaults))
+    //         });
+    //         let res0 = res0.join().expect("can join").expect("did work");
+    //         let res1 = res1.join().expect("can join").expect("did work");
+    //         let res2 = res2.join().expect("can join").expect("did work");
+    //         [res0, res1, res2]
+    //     });
+
+    //     let (reads0, defaults0) = res0;
+    //     let (reads1, defaults1) = res1;
+    //     let (reads2, defaults2) = res2;
+
+    //     for (d0, d1, d2) in izip!(defaults0, defaults1, defaults2) {
+    //         assert_eq!((d0 + d1 + d2).a, random_default_value);
+    //     }
+
+    //     for (r0, r1, r2, should) in izip!(reads0, reads1, reads2, values) {
+    //         assert_eq!((r0 + r1 + r2).a, should);
+    //     }
+    // }
+
+    // #[test]
+    // fn insert_update_then_read() {
+    //     const TEST_SUITE: usize = 100;
+    //     let mut rng = rand::thread_rng();
+
+    //     // generate a random key/values
+    //     let mut keys = Vec::with_capacity(TEST_SUITE);
+    //     let mut values = Vec::with_capacity(TEST_SUITE);
+    //     let mut updates = Vec::with_capacity(TEST_SUITE);
+    //     for _ in 0..TEST_SUITE {
+    //         let mut key = rand::random::<RingElement<u32>>();
+    //         while keys.contains(&key) {
+    //             key = rand::random::<RingElement<u32>>();
+    //         }
+    //         keys.push(key);
+    //         values.push(ark_bn254::Fr::from(rand::random::<u128>()));
+    //         updates.push(ark_bn254::Fr::from(rand::random::<u128>()));
+    //     }
+
+    //     let [key_share0, key_share1, key_share2] =
+    //         rep3_ring::share_ring_elements_binary(&keys, &mut rng);
+    //     let [value_share0, value_share1, value_share2] =
+    //         rep3::share_field_elements(&values, &mut rng);
+    //     let [update_share0, update_share1, update_share2] =
+    //         rep3::share_field_elements(&updates, &mut rng);
+    //     // need two networks
+    //     let [n0, n1, n2] = LocalNetwork::new_3_parties();
+    //     let [n3, n4, n5] = LocalNetwork::new_3_parties();
+    //     let random_default_value = ark_bn254::Fr::from(rand::random::<u128>());
+
+    //     let [res0, res1, res2] = std::thread::scope(|s| {
+    //         let res0 = s.spawn(|| {
+    //             let mut map = LinearScanObliviousMap::with_default_value(random_default_value);
+    //             let mut state = Rep3State::new(&n0, A2BType::Direct).expect("works");
+    //             let mut reads = Vec::with_capacity(TEST_SUITE);
+    //             let mut path_checks = Vec::with_capacity(TEST_SUITE * 3);
+
+    //             for (k, v, u) in izip!(key_share0, value_share0, update_share0) {
+    //                 // insert
+    //                 let insert_path = map.insert(k, v, &n0, &n3, &mut state)?;
+    //                 path_checks.push(map.verify_path(v, &insert_path, &n0, &mut state)?);
+
+    //                 // update
+    //                 let update_path = map.update(k, u, &n0, &n3, &mut state)?;
+    //                 path_checks.push(map.verify_path(u, &update_path, &n0, &mut state)?);
+
+    //                 // verify
+    //                 let read_value = map.read_path_and_witness(k, &n0, &n3, &mut state)?.path[0];
+    //                 reads.push(read_value);
+    //             }
+    //             eyre::Ok((reads, path_checks))
+    //         });
+
+    //         let res1 = s.spawn(|| {
+    //             let mut map = LinearScanObliviousMap::with_default_value(random_default_value);
+    //             let mut state = Rep3State::new(&n1, A2BType::Direct).expect("works");
+    //             let mut reads = Vec::with_capacity(TEST_SUITE);
+    //             let mut path_checks = Vec::with_capacity(TEST_SUITE * 3);
+
+    //             for (k, v, u) in izip!(key_share1, value_share1, update_share1) {
+    //                 // insert
+    //                 let insert_path = map.insert(k, v, &n1, &n4, &mut state)?;
+    //                 path_checks.push(map.verify_path(v, &insert_path, &n1, &mut state)?);
+
+    //                 // update
+    //                 let update_path = map.update(k, u, &n1, &n4, &mut state)?;
+    //                 path_checks.push(map.verify_path(u, &update_path, &n1, &mut state)?);
+
+    //                 // verify
+    //                 let read_value = map.read_path_and_witness(k, &n1, &n4, &mut state)?.path[0];
+    //                 reads.push(read_value);
+    //             }
+    //             eyre::Ok((reads, path_checks))
+    //         });
+
+    //         let res2 = s.spawn(|| {
+    //             let mut map = LinearScanObliviousMap::with_default_value(random_default_value);
+    //             let mut state = Rep3State::new(&n2, A2BType::Direct).expect("works");
+    //             let mut reads = Vec::with_capacity(TEST_SUITE);
+    //             let mut path_checks = Vec::with_capacity(TEST_SUITE * 3);
+
+    //             for (k, v, u) in izip!(key_share2, value_share2, update_share2) {
+    //                 // insert
+    //                 let insert_path = map.insert(k, v, &n2, &n5, &mut state)?;
+    //                 path_checks.push(map.verify_path(v, &insert_path, &n2, &mut state)?);
+
+    //                 // update
+    //                 let update_path = map.update(k, u, &n2, &n5, &mut state)?;
+    //                 path_checks.push(map.verify_path(u, &update_path, &n2, &mut state)?);
+
+    //                 // verify
+    //                 let read_value = map.read_path_and_witness(k, &n2, &n5, &mut state)?.path[0];
+    //                 reads.push(read_value);
+    //             }
+    //             eyre::Ok((reads, path_checks))
+    //         });
+    //         let res0 = res0.join().expect("can join").expect("did work");
+    //         let res1 = res1.join().expect("can join").expect("did work");
+    //         let res2 = res2.join().expect("can join").expect("did work");
+    //         [res0, res1, res2]
+    //     });
+
+    //     let (reads0, checks0) = res0;
+    //     let (reads1, checks1) = res1;
+    //     let (reads2, checks2) = res2;
+
+    //     for (r0, r1, r2, should) in izip!(reads0, reads1, reads2, updates) {
+    //         assert_eq!((r0 + r1 + r2).a, should);
+    //     }
+
+    //     for (r0, r1, r2) in izip!(checks0, checks1, checks2) {
+    //         assert!((r0 + r1 + r2).a.convert().convert());
+    //     }
+    // }
+
+    // #[test]
+    // pub fn insert_then_read_proof() {
+    //     const TEST_SUITE: usize = 1;
+    //     let mut rng = rand::thread_rng();
+
+    //     // generate a random key/values
+    //     let mut keys = Vec::with_capacity(TEST_SUITE);
+    //     let mut values = Vec::with_capacity(TEST_SUITE);
+    //     for _ in 0..TEST_SUITE {
+    //         let mut key = rand::random::<RingElement<u32>>();
+    //         while keys.contains(&key) {
+    //             key = rand::random::<RingElement<u32>>();
+    //         }
+    //         keys.push(key);
+    //         values.push(ark_bn254::Fr::from(rand::random::<u128>()));
+    //     }
+
+    //     let [key_share0, key_share1, key_share2] =
+    //         rep3_ring::share_ring_elements_binary(&keys, &mut rng);
+    //     let [value_share0, value_share1, value_share2] =
+    //         rep3::share_field_elements(&values, &mut rng);
+    //     // just use the same random value, doesn't really matter
+    //     let [r0, r1, r2] = rep3::share_field_element(ark_bn254::Fr::rand(&mut rng), &mut rng);
+
+    //     // need two networks
+    //     let [n0, n1, n2] = LocalNetwork::new_3_parties();
+    //     let [n3, n4, n5] = LocalNetwork::new_3_parties();
+    //     let random_default_value = ark_bn254::Fr::from(rand::random::<u128>());
+
+    //     let root = std::env!("CARGO_MANIFEST_DIR");
+    //     let read_program = ultrahonk::get_program_artifact(format!(
+    //         "{root}/noir/compiled_circuits/oblivious_map_read.json"
+    //     ))
+    //     .unwrap();
+    //     let (proof_schema, pk, cs) = r1cs::setup_r1cs(read_program, &mut rng).unwrap();
+    //     let proof_schema = Arc::new(proof_schema);
+    //     let pk = Arc::new(pk);
+    //     let cs = Arc::new(cs);
+
+    //     let [res0, res1, res2] = std::thread::scope(|s| {
+    //         let res0 = s.spawn(|| {
+    //             let mut map = LinearScanObliviousMap::with_default_value(random_default_value);
+    //             let mut state = Rep3State::new(&n0, A2BType::Direct).expect("works");
+    //             let mut reads = Vec::with_capacity(TEST_SUITE);
+
+    //             for (k, v) in izip!(key_share0, value_share0) {
+    //                 // read first on key before insert
+    //                 map.insert(k, v, &n0, &n3, &mut state)?;
+    //                 reads.push(map.read_e2e(
+    //                     k,
+    //                     &n0,
+    //                     &n3,
+    //                     r0,
+    //                     &mut state,
+    //                     &proof_schema,
+    //                     &cs,
+    //                     &pk,
+    //                 )?);
+    //             }
+    //             eyre::Ok(reads)
+    //         });
+
+    //         let res1 = s.spawn(|| {
+    //             let mut map = LinearScanObliviousMap::with_default_value(random_default_value);
+    //             let mut state = Rep3State::new(&n1, A2BType::Direct).expect("works");
+    //             let mut reads = Vec::with_capacity(TEST_SUITE);
+
+    //             for (k, v) in izip!(key_share1, value_share1) {
+    //                 // read first on key before insert
+    //                 map.insert(k, v, &n1, &n4, &mut state)?;
+    //                 reads.push(map.read_e2e(
+    //                     k,
+    //                     &n1,
+    //                     &n4,
+    //                     r1,
+    //                     &mut state,
+    //                     &proof_schema,
+    //                     &cs,
+    //                     &pk,
+    //                 )?);
+    //             }
+    //             eyre::Ok(reads)
+    //         });
+
+    //         let res2 = s.spawn(|| {
+    //             let mut map = LinearScanObliviousMap::with_default_value(random_default_value);
+    //             let mut state = Rep3State::new(&n2, A2BType::Direct).expect("works");
+    //             let mut reads = Vec::with_capacity(TEST_SUITE);
+
+    //             for (k, v) in izip!(key_share2, value_share2) {
+    //                 // read first on key before insert
+    //                 map.insert(k, v, &n2, &n5, &mut state)?;
+    //                 reads.push(map.read_e2e(
+    //                     k,
+    //                     &n2,
+    //                     &n5,
+    //                     r2,
+    //                     &mut state,
+    //                     &proof_schema,
+    //                     &cs,
+    //                     &pk,
+    //                 )?);
+    //             }
+    //             eyre::Ok(reads)
+    //         });
+    //         let res0 = res0.join().expect("can join").expect("did work");
+    //         let res1 = res1.join().expect("can join").expect("did work");
+    //         let res2 = res2.join().expect("can join").expect("did work");
+    //         [res0, res1, res2]
+    //     });
+
+    //     for (res0, res1, res2, should) in izip!(res0, res1, res2, values) {
+    //         let (reads0, proof0, public_input0) = res0;
+    //         let (reads1, proof1, public_input1) = res1;
+    //         let (reads2, proof2, public_input2) = res2;
+    //         assert!(
+    //             r1cs::verify(&pk.vk, &proof0, &public_input0).unwrap(),
+    //             "proof verifies"
+    //         );
+    //         assert!(
+    //             r1cs::verify(&pk.vk, &proof1, &public_input1).unwrap(),
+    //             "proof verifies"
+    //         );
+    //         assert!(
+    //             r1cs::verify(&pk.vk, &proof2, &public_input2).unwrap(),
+    //             "proof verifies"
+    //         );
+    //         assert_eq!((reads0 + reads1 + reads2).a, should);
+    //     }
+    // }
 }

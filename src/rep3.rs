@@ -14,7 +14,6 @@ use mpc_core::protocols::{
 };
 use mpc_net::Network;
 use rand::{CryptoRng, Rng};
-use rayon::prelude::*;
 
 // TODO check out https://github.com/recmo/uint for share over F::BigInt
 #[derive(Default, Debug, Clone, CanonicalSerialize, CanonicalDeserialize)]
@@ -125,39 +124,6 @@ macro_rules! fold_stage {
     }};
 }
 
-macro_rules! and_fold_mr {
-    ($ele: expr, $mask_a: expr,$mask_b: expr, $typ: ty, $bitlen: expr) => {{
-        $mask_a ^= $mask_b;
-        let y_a = $ele.a >> $bitlen;
-        let y_b = $ele.b >> $bitlen;
-        $mask_a ^= RingElement::<$typ>::from(($ele.a & y_a).convert() as $typ);
-        $mask_a ^= RingElement::<$typ>::from(($ele.b & y_a).convert() as $typ);
-        $mask_a ^= RingElement::<$typ>::from(($ele.a & y_b).convert() as $typ);
-        $mask_a
-    }};
-}
-
-macro_rules! fold_stage_mr {
-    ($x:expr, $state:expr, $net:expr, $t:ty, $bits:expr) => {{
-        let r0 = (0..$x.len())
-            .map(|_| $state.rngs.rand.random_element_rng1::<RingElement<$t>>())
-            .collect_vec();
-        let r1 = (0..$x.len())
-            .map(|_| $state.rngs.rand.random_element_rng2::<RingElement<$t>>())
-            .collect_vec();
-
-        let a = ($x, r0, r1)
-            .into_par_iter()
-            .with_min_len(512)
-            .map(|(v, mut r0, r1)| and_fold_mr!(v, r0, r1, $t, $bits))
-            .collect::<Vec<_>>();
-        let b = $net.reshare_many(&a)?;
-        izip!(a, b)
-            .map(|(a, b)| Rep3RingShare::<$t>::new_ring(a, b))
-            .collect_vec()
-    }};
-}
-
 pub(crate) fn is_zero_many<N: Network>(
     mut x: Vec<Rep3RingShare<u32>>,
     net: &N,
@@ -172,24 +138,6 @@ pub(crate) fn is_zero_many<N: Network>(
     let x = fold_stage!(x, state, net, u8, 4);
     let x = fold_stage!(x, state, net, u8, 2);
     let x = fold_stage!(x, state, net, u8, 1);
-
-    Ok(x.into_iter().map(|x| x.get_bit(0)).collect())
-}
-
-pub(crate) fn is_zero_many_mt<N: Network>(
-    mut x: Vec<Rep3RingShare<u32>>,
-    net: &N,
-    state: &mut Rep3State,
-) -> eyre::Result<Vec<Rep3RingShare<Bit>>> {
-    let one = RingElement::one();
-    let mask_neg = (one << 32) - one;
-    x.iter_mut().for_each(|x| *x ^= mask_neg);
-
-    let x = fold_stage_mr!(x, state, net, u16, 16);
-    let x = fold_stage_mr!(x, state, net, u8, 8);
-    let x = fold_stage_mr!(x, state, net, u8, 4);
-    let x = fold_stage_mr!(x, state, net, u8, 2);
-    let x = fold_stage_mr!(x, state, net, u8, 1);
 
     Ok(x.into_iter().map(|x| x.get_bit(0)).collect())
 }

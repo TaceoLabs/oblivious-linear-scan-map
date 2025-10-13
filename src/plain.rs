@@ -1,11 +1,12 @@
 use ark_ff::{BigInteger256, PrimeField, UniformRand as _, Zero as _};
+use co_noir_to_r1cs::noir::{r1cs, ultrahonk};
 use mpc_core::{
     gadgets::poseidon2::Poseidon2,
     protocols::rep3_ring::{self, ring::ring_impl::RingElement},
 };
 use rand::{CryptoRng, Rng};
 
-use crate::{LINEAR_SCAN_TREE_DEPTH, LinearScanObliviousMap};
+use crate::{LINEAR_SCAN_TREE_DEPTH, LinearScanObliviousMap, groth16::Groth16Material};
 
 #[derive(Debug, Default, Clone)]
 struct Layer<F: PrimeField> {
@@ -56,7 +57,6 @@ impl<F: PrimeField> Layer<F> {
 pub struct LinearScanMap {
     layers: [Layer<ark_bn254::Fr>; LINEAR_SCAN_TREE_DEPTH],
     leaf_count: usize,
-    total_count: usize,
     defaults: [BigInteger256; LINEAR_SCAN_TREE_DEPTH],
     root: ark_bn254::Fr,
 }
@@ -75,7 +75,6 @@ impl LinearScanMap {
     }
 
     pub fn with_garbage_values<R: Rng>(mut keys: Vec<u32>, rng: &mut R) -> Self {
-        let mut total_count = 0;
         let mut layers = Vec::with_capacity(LINEAR_SCAN_TREE_DEPTH);
         for _ in 0..LINEAR_SCAN_TREE_DEPTH {
             let mut layer = Layer::default();
@@ -91,7 +90,6 @@ impl LinearScanMap {
                 .collect::<Vec<_>>();
             layer.keys = keys;
             keys = new_keys;
-            total_count += keys.len();
             layers.push(layer);
         }
         let mut default_value = ark_bn254::Fr::zero();
@@ -104,13 +102,15 @@ impl LinearScanMap {
         Self {
             layers: layers.try_into().expect("works"),
             leaf_count: keys.len(),
-            total_count,
             defaults,
             root: default_value,
         }
     }
 
-    pub fn share<R: Rng + CryptoRng>(&self, rng: &mut R) -> [LinearScanObliviousMap; 3] {
+    pub fn share<R: Rng + CryptoRng>(
+        &self,
+        rng: &mut R,
+    ) -> eyre::Result<[LinearScanObliviousMap; 3]> {
         let mut total_count = 0;
         let leaf_count = self.layers[0].len();
         let mut layers0 = Vec::with_capacity(self.layers.len());
@@ -123,6 +123,12 @@ impl LinearScanMap {
             layers1.push(layer1);
             layers2.push(layer2);
         }
+        let root = std::env!("CARGO_MANIFEST_DIR");
+        let read_program = ultrahonk::get_program_artifact(format!(
+            "{root}/noir/compiled_circuits/oblivious_map_read.json"
+        ))?;
+        let (proof_schema, pk, cs) = r1cs::setup_r1cs(read_program, &mut rand::thread_rng())?;
+        let read_material = Groth16Material::new(proof_schema, cs, pk.clone());
 
         let res0 = LinearScanObliviousMap {
             layers: layers0.try_into().expect("works"),
@@ -130,6 +136,7 @@ impl LinearScanMap {
             leaf_count,
             root: self.root,
             defaults: self.defaults,
+            read_groth16: read_material.clone(),
         };
         let res1 = LinearScanObliviousMap {
             layers: layers1.try_into().expect("works"),
@@ -137,6 +144,7 @@ impl LinearScanMap {
             leaf_count,
             root: self.root,
             defaults: self.defaults,
+            read_groth16: read_material.clone(),
         };
         let res2 = LinearScanObliviousMap {
             layers: layers2.try_into().expect("works"),
@@ -144,7 +152,8 @@ impl LinearScanMap {
             leaf_count,
             root: self.root,
             defaults: self.defaults,
+            read_groth16: read_material,
         };
-        [res0, res1, res2]
+        Ok([res0, res1, res2])
     }
 }
