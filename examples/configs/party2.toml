@@ -10,7 +10,7 @@ my_id = 1
 bind_addr = "0.0.0.0:10001"
 key_path = "./data/key1.der"
 timeout = "30min"
-max_frame_length = 130000009
+max_frame_length = 192000009
 [[network.parties]]
 id = 0
 # normally we would use DNS name here such as localhost, but localhost under windows is resolved to ::1, which causes problems since we bind to ipv4 above

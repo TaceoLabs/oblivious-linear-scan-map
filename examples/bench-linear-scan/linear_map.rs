@@ -69,7 +69,8 @@ impl LinearScanMap {
 
     pub fn with_garbage_values<R: Rng>(mut keys: Vec<u32>, rng: &mut R) -> Self {
         let mut layers = Vec::with_capacity(LINEAR_SCAN_TREE_DEPTH);
-        for _ in 0..LINEAR_SCAN_TREE_DEPTH {
+        let mut current_size = keys.len();
+        for lvl in 0..LINEAR_SCAN_TREE_DEPTH {
             let mut layer = Layer::default();
 
             let mut new_keys = Vec::with_capacity(keys.len());
@@ -78,11 +79,15 @@ impl LinearScanMap {
                 new_keys.push(new_key);
             }
 
-            layer.values = (0..keys.len())
+            layer.values = (0..current_size)
                 .map(|_| ark_bn254::Fr::rand(rng))
                 .collect::<Vec<_>>();
+            if lvl != 0 && 1 << (32 - lvl) < current_size {
+                current_size = 1 << (32 - lvl);
+            }
             layer.keys = keys;
             keys = new_keys;
+            tracing::info!("current size: {current_size}");
             layers.push(layer);
         }
         let mut default_value = ark_bn254::Fr::zero();
