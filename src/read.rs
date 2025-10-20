@@ -179,22 +179,7 @@ impl LinearScanObliviousMap {
         state: &mut Rep3State,
     ) -> eyre::Result<Vec<Rep3PrimeFieldShare<ark_bn254::Fr>>> {
         let path_ohv = crate::rep3::is_zero_many(self.find_path(key), net, state)?;
-        let mut dots_a = Vec::with_capacity(LINEAR_SCAN_TREE_DEPTH);
-        let mut start = 0;
-        for (layer, default) in izip!(self.layers.iter(), self.defaults.into_iter()) {
-            let end = start + layer.keys.len();
-            let dot = Self::dot(&path_ohv[start..end], &layer.values, default, state);
-            start = end;
-            dots_a.push(dot);
-        }
-        let dots_b = net.reshare_many(&dots_a)?;
-        let dots = izip!(dots_a, dots_b)
-            .map(|(a, b)| Rep3BigUintShare::<ark_bn254::Fr>::new(a.into(), b.into()))
-            .collect_vec();
-
-        let dots = conversion::b2a_many(&dots, net, state)?;
-
-        Ok(dots)
+        self.read_from_layers_with_ohv(&path_ohv, net, state)
     }
 
     #[expect(clippy::type_complexity)]
@@ -239,22 +224,6 @@ impl LinearScanObliviousMap {
         for layer in self.layers.iter() {
             for hay in layer.keys.iter() {
                 path_ohv.push(hay ^ &needle);
-            }
-
-            needle.a >>= 1;
-            needle.b >>= 1;
-        }
-        path_ohv
-    }
-
-    fn find_witness(&self, mut needle: Rep3RingShare<u32>) -> Vec<Rep3RingShare<u32>> {
-        // To find the witness
-        let mut path_ohv = Vec::with_capacity(self.total_count);
-        let one = RingElement::one();
-        for layer in self.layers.iter() {
-            let neighbor_key = needle ^ one;
-            for hay in layer.keys.iter() {
-                path_ohv.push(hay ^ &neighbor_key);
             }
 
             needle.a >>= 1;

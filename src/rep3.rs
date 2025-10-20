@@ -3,13 +3,16 @@ use std::marker::PhantomData;
 use ark_ff::{One as _, PrimeField, Zero as _};
 use ark_serialize::{CanonicalDeserialize, CanonicalSerialize};
 use itertools::{Itertools as _, izip};
-use mpc_core::protocols::{
-    rep3::{
-        Rep3BigUintShare, Rep3PrimeFieldShare, Rep3State, id::PartyID, network::Rep3NetworkExt,
-    },
-    rep3_ring::{
-        Rep3RingShare,
-        ring::{bit::Bit, ring_impl::RingElement},
+use mpc_core::{
+    MpcState as _,
+    protocols::{
+        rep3::{
+            Rep3BigUintShare, Rep3PrimeFieldShare, Rep3State, id::PartyID, network::Rep3NetworkExt,
+        },
+        rep3_ring::{
+            Rep3RingShare,
+            ring::{bit::Bit, ring_impl::RingElement},
+        },
     },
 };
 use mpc_net::Network;
@@ -225,6 +228,33 @@ pub(crate) fn bit_inject_from_bits_to_field_many<N: Network>(
         .zip(res_b)
         .map(|(a, b)| Rep3PrimeFieldShare::new(a, b))
         .collect())
+}
+
+#[expect(clippy::complexity)]
+pub(crate) fn is_zero_many_bitinject_parallel<N: Rep3NetworkExt>(
+    key_bits: &[Rep3RingShare<Bit>],
+    to_compare: Vec<Rep3RingShare<u32>>,
+    net0: &N,
+    net1: &N,
+    state0: &mut Rep3State,
+) -> eyre::Result<(
+    Vec<Rep3RingShare<Bit>>,
+    Vec<Rep3PrimeFieldShare<ark_bn254::Fr>>,
+)> {
+    let mut state1 = state0.fork(1).expect("Rep3 fork cannot fail");
+    let (ohv_layer, bitinject) = std::thread::scope(|s| {
+        let ohv_layer = s.spawn(|| crate::rep3::is_zero_many(to_compare, net0, state0));
+        let bitinject = s
+            .spawn(|| crate::rep3::bit_inject_from_bits_to_field_many(key_bits, net1, &mut state1));
+        (
+            ohv_layer.join().expect("can join"),
+            bitinject.join().expect("can join"),
+        )
+    });
+
+    let ohv_layer = ohv_layer?;
+    let bitinject = bitinject?;
+    Ok((ohv_layer, bitinject))
 }
 
 #[cfg(test)]

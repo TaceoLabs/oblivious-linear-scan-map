@@ -127,6 +127,12 @@ impl LinearScanMap {
         let (proof_schema, pk, cs) = r1cs::setup_r1cs(read_program, &mut rand::thread_rng())?;
         let read_material = Groth16Material::new(proof_schema, cs, pk.clone());
 
+        let write_program = ultrahonk::get_program_artifact(format!(
+            "{root}/noir/compiled_circuits/oblivious_map_write.json"
+        ))?;
+        let (proof_schema, pk, cs) = r1cs::setup_r1cs(write_program, &mut rand::thread_rng())?;
+        let write_material = Groth16Material::new(proof_schema, cs, pk.clone());
+
         let res0 = LinearScanObliviousMap::from_shared_values(
             layers0.try_into().expect("works"),
             leaf_count,
@@ -134,6 +140,7 @@ impl LinearScanMap {
             self.defaults,
             self.root,
             read_material.clone(),
+            write_material.clone(),
         );
         let res1 = LinearScanObliviousMap::from_shared_values(
             layers1.try_into().expect("works"),
@@ -142,6 +149,7 @@ impl LinearScanMap {
             self.defaults,
             self.root,
             read_material.clone(),
+            write_material.clone(),
         );
         let res2 = LinearScanObliviousMap::from_shared_values(
             layers2.try_into().expect("works"),
@@ -150,6 +158,7 @@ impl LinearScanMap {
             self.defaults,
             self.root,
             read_material.clone(),
+            write_material.clone(),
         );
         Ok([res0, res1, res2])
     }
