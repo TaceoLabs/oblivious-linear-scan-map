@@ -331,8 +331,8 @@ mod tests {
         let random_default_value = ark_bn254::Fr::from(rand::random::<u128>());
 
         let material0 = groth16_material()?;
-        let material1 = groth16_material()?;
-        let material2 = groth16_material()?;
+        let material1 = material0.clone();
+        let material2 = material0.clone();
         let read_vk = material0.0.pk.vk.clone();
 
         let [res0, res1, res2] = std::thread::scope(|s| {
@@ -344,8 +344,7 @@ mod tests {
                     write_groth16,
                 );
                 let mut state = Rep3State::new(&n0, A2BType::Direct).expect("works");
-                let read_value = map.oblivious_read(key_share0, &n0, &n3, r0, &mut state)?;
-                eyre::Ok(read_value)
+                map.oblivious_read(key_share0, &n0, &n3, r0, &mut state)
             });
 
             let res1 = s.spawn(|| {
@@ -388,7 +387,7 @@ mod tests {
 
     #[test]
     fn insert_then_read() -> eyre::Result<()> {
-        const TEST_SUITE: usize = 1;
+        const TEST_SUITE: usize = 10;
         let mut rng = rand::thread_rng();
 
         // generate a random key/values
@@ -417,8 +416,8 @@ mod tests {
         let random_default_value = ark_bn254::Fr::from(rand::random::<u128>());
 
         let material0 = groth16_material()?;
-        let material1 = groth16_material()?;
-        let material2 = groth16_material()?;
+        let material1 = material0.clone();
+        let material2 = material0.clone();
         let read_vk = material0.0.pk.vk.clone();
         let write_vk = material0.1.pk.vk.clone();
 

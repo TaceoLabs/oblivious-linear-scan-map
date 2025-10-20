@@ -100,13 +100,13 @@ impl LinearScanObliviousMap {
         for (other, position) in izip!(merkle_witness, bitinject.clone()) {
             let left_a_n = (other - current_value) * position + current_value.a;
             let right_a_n = (current_value - other) * position + other.a;
-            let left_a_d = (other - current_value_default) * position + current_value.a;
+            let left_a_d = (other - current_value_default) * position + current_value_default.a;
             let right_a_d = (current_value_default - other) * position + other.a;
             let bs = net0.reshare_many(&[left_a_n, right_a_n, left_a_d, right_a_d])?;
             let left_n = Rep3PrimeFieldShare::new(left_a_n, bs[0]);
             let right_n = Rep3PrimeFieldShare::new(right_a_n, bs[1]);
-            let left_d = Rep3PrimeFieldShare::new(left_a_n, bs[2]);
-            let right_d = Rep3PrimeFieldShare::new(right_a_n, bs[3]);
+            let left_d = Rep3PrimeFieldShare::new(left_a_d, bs[2]);
+            let right_d = Rep3PrimeFieldShare::new(right_a_d, bs[3]);
             // let poseidon_inputs_n = [left_n, right_n];
             // let poseidon_inputs_d = [left_d, right_d];
             let (hashes, trace) = poseidon2.hash_rep3_generate_noir_trace_many::<_, 2, 4>(
@@ -129,7 +129,6 @@ impl LinearScanObliviousMap {
         }
         self.leaf_count += 1;
         self.total_count += LINEAR_SCAN_TREE_DEPTH;
-        let old_root = self.root;
         self.root = arithmetic::open(current_value, net0)?;
 
         let shift = LINEAR_SCAN_TREE_DEPTH - 1;
@@ -149,8 +148,8 @@ impl LinearScanObliviousMap {
             start = end;
         }
         let mut inputs = Vec::with_capacity(68);
-        inputs.push(old_root.into());
-        inputs.push(self.root.into());
+        inputs.push(ark_bn254::Fr::from(self.defaults[0]).into());
+        inputs.push(insert_value.into());
 
         for p in bitinject.clone().into_iter() {
             inputs.push(p.into());
@@ -199,8 +198,6 @@ impl LinearScanObliviousMap {
             pk,
         } = &self.write_groth16;
 
-        println!("inputs len: {}", inputs.len());
-        println!("traces len: {}", traces.len());
         let r1cs = r1cs::trace_to_r1cs_witness(inputs, traces, proof_schema, net0, net1, state0)?;
         let witness = r1cs::r1cs_witness_to_cogroth16(proof_schema, r1cs, state0.id);
         let (proof, public_inputs) = r1cs::prove(cs, pk, witness, net0, net1)?;
