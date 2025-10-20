@@ -1,6 +1,6 @@
 use std::marker::PhantomData;
 
-use ark_ff::{One as _, PrimeField};
+use ark_ff::{One as _, PrimeField, Zero as _};
 use ark_serialize::{CanonicalDeserialize, CanonicalSerialize};
 use itertools::{Itertools as _, izip};
 use mpc_core::protocols::{
@@ -13,15 +13,31 @@ use mpc_core::protocols::{
     },
 };
 use mpc_net::Network;
+use rand::{CryptoRng, Rng};
 
 // TODO check out https://github.com/recmo/uint for share over F::BigInt
-#[derive(Default, Clone, CanonicalSerialize, CanonicalDeserialize)]
+#[derive(Default, Debug, Clone, CanonicalSerialize, CanonicalDeserialize)]
 pub struct Rep3BigIntShare<F: PrimeField> {
     /// Share of this party
     pub a: F::BigInt,
     /// Share of the prev party
     pub b: F::BigInt,
     pub(crate) phantom: PhantomData<F>,
+}
+pub fn share_values_ring<F: PrimeField, R: Rng + CryptoRng>(
+    values: &[F],
+    rng: &mut R,
+) -> [Vec<Rep3BigIntShare<F>>; 3] {
+    let mut shares1 = Vec::with_capacity(values.len());
+    let mut shares2 = Vec::with_capacity(values.len());
+    let mut shares3 = Vec::with_capacity(values.len());
+    for val in values {
+        let [share1, share2, share3] = mpc_core::protocols::rep3::share_biguint(*val, rng);
+        shares1.push(share1.try_into().expect("Works"));
+        shares2.push(share2.try_into().expect("Works"));
+        shares3.push(share3.try_into().expect("Works"));
+    }
+    [shares1, shares2, shares3]
 }
 
 impl<F: PrimeField> TryFrom<Rep3BigUintShare<F>> for Rep3BigIntShare<F> {
@@ -126,11 +142,11 @@ pub(crate) fn is_zero_many<N: Network>(
     Ok(x.into_iter().map(|x| x.get_bit(0)).collect())
 }
 
-pub(crate) fn bit_inject_from_bits_to_field_many<F: PrimeField, N: Network>(
+pub(crate) fn bit_inject_from_bits_to_field_many<N: Network>(
     x: &[Rep3RingShare<Bit>],
     net: &N,
     state: &mut Rep3State,
-) -> eyre::Result<Vec<Rep3PrimeFieldShare<F>>> {
+) -> eyre::Result<Vec<Rep3PrimeFieldShare<ark_bn254::Fr>>> {
     let mut res_a = Vec::with_capacity(x.len());
 
     // Approach: Split the value into x and y and compute an arithmetic xor.
@@ -139,11 +155,11 @@ pub(crate) fn bit_inject_from_bits_to_field_many<F: PrimeField, N: Network>(
     let res_b = match state.id {
         PartyID::ID0 => {
             for el in x.iter() {
-                let x0: F = state.rngs.rand.masking_field_element();
+                let x0 = state.rngs.rand.masking_field_element::<ark_bn254::Fr>();
                 let y = if el.b.0.convert() {
-                    F::one()
+                    ark_bn254::Fr::one()
                 } else {
-                    F::zero()
+                    ark_bn254::Fr::zero()
                 };
 
                 let z0 = y * x0;
@@ -154,7 +170,7 @@ pub(crate) fn bit_inject_from_bits_to_field_many<F: PrimeField, N: Network>(
             net.send_next_many(&res_a)?;
 
             // Receive from P2
-            let res_b: Vec<F> = net.recv_prev_many()?;
+            let res_b: Vec<ark_bn254::Fr> = net.recv_prev_many()?;
             if res_b.len() != x.len() {
                 eyre::bail!("Received wrong number of elements");
             }
@@ -162,9 +178,9 @@ pub(crate) fn bit_inject_from_bits_to_field_many<F: PrimeField, N: Network>(
         }
         PartyID::ID1 => {
             for el in x.iter() {
-                let x1: F = state.rngs.rand.masking_field_element();
+                let x1 = state.rngs.rand.masking_field_element();
                 res_a.push(if el.a.0.convert() ^ el.b.0.convert() {
-                    x1 + F::one()
+                    x1 + ark_bn254::Fr::one()
                 } else {
                     x1
                 });
@@ -173,7 +189,7 @@ pub(crate) fn bit_inject_from_bits_to_field_many<F: PrimeField, N: Network>(
             net.send_next_many(&res_a)?;
 
             // Receive from P0
-            let res_b: Vec<F> = net.recv_prev_many()?;
+            let res_b: Vec<ark_bn254::Fr> = net.recv_prev_many()?;
             if res_b.len() != x.len() {
                 eyre::bail!("Received wrong number of elements");
             }
@@ -181,17 +197,17 @@ pub(crate) fn bit_inject_from_bits_to_field_many<F: PrimeField, N: Network>(
         }
         PartyID::ID2 => {
             // Receive from P1
-            let res_b: Vec<F> = net.recv_prev_many()?;
+            let res_b: Vec<ark_bn254::Fr> = net.recv_prev_many()?;
             if res_b.len() != x.len() {
                 eyre::bail!("Received wrong number of elements");
             }
 
             for (el, x1) in izip!(x.iter(), res_b.iter()) {
-                let x2: F = state.rngs.rand.masking_field_element();
+                let x2 = state.rngs.rand.masking_field_element::<ark_bn254::Fr>();
                 let y = if el.a.0.convert() {
-                    F::one()
+                    ark_bn254::Fr::one()
                 } else {
-                    F::zero()
+                    ark_bn254::Fr::zero()
                 };
                 let z2 = y * (*x1 + x2);
                 let r2 = x2 - z2 - z2;
@@ -207,7 +223,7 @@ pub(crate) fn bit_inject_from_bits_to_field_many<F: PrimeField, N: Network>(
     Ok(res_a
         .into_iter()
         .zip(res_b)
-        .map(|(a, b)| Rep3PrimeFieldShare::<F>::new(a, b))
+        .map(|(a, b)| Rep3PrimeFieldShare::new(a, b))
         .collect())
 }
 

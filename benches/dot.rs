@@ -1,12 +1,9 @@
 use ark_ff::PrimeField;
 use criterion::{Criterion, criterion_group, criterion_main};
 use itertools::Itertools as _;
-use mpc_core::{
-    gadgets::poseidon2::Poseidon2,
-    protocols::{
-        rep3::rngs::Rep3Rand,
-        rep3_ring::{Rep3RingShare, ring::bit::Bit},
-    },
+use mpc_core::protocols::{
+    rep3::rngs::Rep3Rand,
+    rep3_ring::{Rep3RingShare, ring::bit::Bit},
 };
 use oblivious_linear_scan_map::rep3::Rep3BigIntShare;
 
