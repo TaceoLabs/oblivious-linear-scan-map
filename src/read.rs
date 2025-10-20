@@ -40,7 +40,7 @@ pub struct ObliviousReadResult {
 }
 
 impl LinearScanObliviousMap {
-    pub fn read<N: Rep3NetworkExt>(
+    pub fn oblivious_read<N: Rep3NetworkExt>(
         &self,
         key: Rep3RingShare<u32>,
         net0: &N,
@@ -50,7 +50,7 @@ impl LinearScanObliviousMap {
     ) -> eyre::Result<ObliviousReadResult> {
         let path_and_witness = self.read_path_and_witness(key, net0, net1, state0)?;
         let trace =
-            self.read_build_execution_trace(net0, path_and_witness, randomness_commitment, state0)?;
+            self.build_read_execution_trace(net0, path_and_witness, randomness_commitment, state0)?;
         self.groth16_read_proof(net0, net1, trace, state0)
     }
 
@@ -93,7 +93,7 @@ impl LinearScanObliviousMap {
     ) -> eyre::Result<PathAndWitness> {
         let mut state1 = state0.fork(1).expect("cannot fail for rep3");
         let (path, (witness, positions)) = std::thread::scope(|s| {
-            let read_path = s.spawn(|| self.read_path(key, net0, state0));
+            let read_path = s.spawn(|| self.read_merkle_path(key, net0, state0));
             let witness = s.spawn(|| self.read_merkle_witness(key, net1, &mut state1));
             let path = read_path.join().expect("can join")?;
             let witness = witness.join().expect("can join")?;
@@ -106,7 +106,7 @@ impl LinearScanObliviousMap {
         })
     }
 
-    fn read_build_execution_trace<N: Rep3NetworkExt>(
+    fn build_read_execution_trace<N: Rep3NetworkExt>(
         &self,
         net: &N,
         path_and_witness: PathAndWitness,
@@ -172,7 +172,7 @@ impl LinearScanObliviousMap {
         })
     }
 
-    pub fn read_path<N: Rep3NetworkExt>(
+    fn read_merkle_path<N: Rep3NetworkExt>(
         &self,
         key: Rep3RingShare<u32>,
         net: &N,
@@ -197,41 +197,8 @@ impl LinearScanObliviousMap {
         Ok(dots)
     }
 
-    pub fn read_path_dots_mt<N: Rep3NetworkExt>(
-        &self,
-        key: Rep3RingShare<u32>,
-        net: &N,
-        state: &mut Rep3State,
-    ) -> eyre::Result<Vec<Rep3PrimeFieldShare<ark_bn254::Fr>>> {
-        let path_ohv = crate::rep3::is_zero_many(self.find_path(key), net, state)?;
-        let mut dots_a = Vec::with_capacity(LINEAR_SCAN_TREE_DEPTH);
-        let mut start = 0;
-        let mut offsets = Vec::with_capacity(LINEAR_SCAN_TREE_DEPTH);
-        for layer in self.layers.iter() {
-            let end = start + layer.keys.len();
-            offsets.push((start, end));
-            start = end;
-        }
-        for (layer, default, (start, end)) in izip!(
-            self.layers.iter(),
-            self.defaults.into_iter(),
-            offsets.into_iter()
-        ) {
-            let dot = Self::dot(&path_ohv[start..end], &layer.values, default, state);
-            dots_a.push(dot);
-        }
-        let dots_b = net.reshare_many(&dots_a)?;
-        let dots = izip!(dots_a, dots_b)
-            .map(|(a, b)| Rep3BigUintShare::<ark_bn254::Fr>::new(a.into(), b.into()))
-            .collect_vec();
-
-        let dots = conversion::b2a_many(&dots, net, state)?;
-
-        Ok(dots)
-    }
-
     #[expect(clippy::type_complexity)]
-    pub fn read_merkle_witness<N: Rep3NetworkExt>(
+    fn read_merkle_witness<N: Rep3NetworkExt>(
         &self,
         key: Rep3RingShare<u32>,
         net: &N,
@@ -244,7 +211,7 @@ impl LinearScanObliviousMap {
         let witness_ohv = self.find_witness(key);
         let key_bits = (0..32).map(|shift| (key >> shift).get_bit(0)).collect_vec();
 
-        // we could maybe parallelize this with another network, but the bitinject is negligible in contrast to the AND-tree and poseidon hashes, therefore we stick with one two networks.
+        // we could maybe parallelize this with another network, but the bitinject is negligible in contrast to the AND-tree and poseidon hashes, therefore we stick with two networks.
         let ohv_layer = crate::rep3::is_zero_many(witness_ohv, net, state)?;
         let bitinject = crate::rep3::bit_inject_from_bits_to_field_many(&key_bits, net, state)?;
 
@@ -281,7 +248,7 @@ impl LinearScanObliviousMap {
     }
 
     fn find_witness(&self, mut needle: Rep3RingShare<u32>) -> Vec<Rep3RingShare<u32>> {
-        // To find the path
+        // To find the witness
         let mut path_ohv = Vec::with_capacity(self.total_count);
         let one = RingElement::one();
         for layer in self.layers.iter() {

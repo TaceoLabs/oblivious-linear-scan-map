@@ -19,24 +19,23 @@ use mpc_net::Network;
 
 use crate::rep3::Rep3BigIntShare;
 mod groth16;
-mod insert;
+//mod insert;
+#[cfg(feature = "local")]
+pub mod local;
 pub mod read;
 pub mod rep3;
-mod update;
+//mod update;
 
 pub use groth16::Groth16Material;
 
 pub const DELETED_LEAF_VALUE: u64 = 0xDEADBEEF;
 pub const LINEAR_SCAN_TREE_DEPTH: usize = 32;
 
-#[derive(Clone)]
-pub struct ObliviousMembershipProof(pub Vec<ObliviousMerkleWitnessElement>);
-
 struct NetworkRound1Result<F: PrimeField>(Vec<Rep3RingShare<Bit>>, Vec<Rep3PrimeFieldShare<F>>);
 
 #[derive(Clone)]
 /// A witness of proving one layer in a Merkle tree.
-pub struct ObliviousMerkleWitnessElement {
+struct ObliviousMerkleWitnessElement {
     /// Determines the other value required to compute the hash for the next layer.
     pub other: Rep3PrimeFieldShare<ark_bn254::Fr>,
     /// Determines the position for the prove element in the hash for current layer.
@@ -112,35 +111,35 @@ impl LinearScanObliviousMap {
         LINEAR_SCAN_TREE_DEPTH
     }
 
-    pub fn verify_path<N: Network>(
-        &self,
-        element: Rep3PrimeFieldShare<ark_bn254::Fr>,
-        path: &ObliviousMembershipProof,
-        net: &N,
-        state: &mut Rep3State,
-    ) -> eyre::Result<Rep3RingShare<Bit>> {
-        let poseidon2 = Poseidon2::<ark_bn254::Fr, 2, 5>::default();
-        let mut poseidon2_precomputations =
-            poseidon2.precompute_rep3(LINEAR_SCAN_TREE_DEPTH, net, state)?;
+    // pub(crate) fn verify_path<N: Network>(
+    //     &self,
+    //     element: Rep3PrimeFieldShare<ark_bn254::Fr>,
+    //     path: &ObliviousMembershipProof,
+    //     net: &N,
+    //     state: &mut Rep3State,
+    // ) -> eyre::Result<Rep3RingShare<Bit>> {
+    //     let poseidon2 = Poseidon2::<ark_bn254::Fr, 2, 5>::default();
+    //     let mut poseidon2_precomputations =
+    //         poseidon2.precompute_rep3(LINEAR_SCAN_TREE_DEPTH, net, state)?;
 
-        let mut current_value = element;
-        for p in path.0.iter() {
-            current_value = Self::poseidon2_cmux(
-                p,
-                current_value,
-                net,
-                &poseidon2,
-                &mut poseidon2_precomputations,
-            )?;
-        }
-        // current_value == self.root
-        let eq = arithmetic::eq_bit_public(current_value, self.root, net, state)?;
+    //     let mut current_value = element;
+    //     for p in path.0.iter() {
+    //         current_value = Self::poseidon2_cmux(
+    //             p,
+    //             current_value,
+    //             net,
+    //             &poseidon2,
+    //             &mut poseidon2_precomputations,
+    //         )?;
+    //     }
+    //     // current_value == self.root
+    //     let eq = arithmetic::eq_bit_public(current_value, self.root, net, state)?;
 
-        // Translate to BitShare
-        let eq = Rep3RingShare::<Bit>::new(eq.a.bit(0).into(), eq.b.bit(0).into());
+    //     // Translate to BitShare
+    //     let eq = Rep3RingShare::<Bit>::new(eq.a.bit(0).into(), eq.b.bit(0).into());
 
-        Ok(eq)
-    }
+    //     Ok(eq)
+    // }
 
     // finds the path of the member (its neighbors)
     fn find_path_and_key_decompose(
@@ -346,7 +345,7 @@ mod tests {
                     read_material0,
                 );
                 let mut state = Rep3State::new(&n0, A2BType::Direct).expect("works");
-                let read_value = map.read(key_share0, &n0, &n3, r0, &mut state)?;
+                let read_value = map.oblivious_read(key_share0, &n0, &n3, r0, &mut state)?;
                 eyre::Ok(read_value)
             });
 
@@ -356,7 +355,7 @@ mod tests {
                     read_material1,
                 );
                 let mut state = Rep3State::new(&n1, A2BType::Direct).expect("works");
-                map.read(key_share1, &n1, &n4, r1, &mut state)
+                map.oblivious_read(key_share1, &n1, &n4, r1, &mut state)
             });
 
             let res2 = s.spawn(|| {
@@ -365,7 +364,7 @@ mod tests {
                     read_material2,
                 );
                 let mut state = Rep3State::new(&n2, A2BType::Direct).expect("works");
-                map.read(key_share2, &n2, &n5, r2, &mut state)
+                map.oblivious_read(key_share2, &n2, &n5, r2, &mut state)
             });
             let res0 = res0.join().expect("can join").expect("did work");
             let res1 = res1.join().expect("can join").expect("did work");

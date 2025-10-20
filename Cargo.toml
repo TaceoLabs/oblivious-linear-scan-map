@@ -3,6 +3,10 @@ name = "oblivious-linear-scan-map"
 version = "0.1.0"
 edition = "2024"
 
+[features]
+default = ["local"]
+local = []
+
 [dependencies]
 ark-bn254 = "0.5"
 ark-ff = "0.5"
@@ -29,6 +33,10 @@ rustls = "0.23"
 serde = { version = "1.0.193", features = ["derive", "rc"] }
 tracing = "0.1.40"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[[example]]
+name = "bench-linear-scan"
+required-features = ["local"]
 
 [[bench]]
 name = "is_zero"

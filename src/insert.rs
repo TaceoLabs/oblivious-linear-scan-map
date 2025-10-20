@@ -12,7 +12,7 @@ use crate::{
 };
 
 impl LinearScanObliviousMap {
-    pub fn insert<N: Rep3NetworkExt>(
+    fn insert<N: Rep3NetworkExt>(
         &mut self,
         mut key: Rep3RingShare<u32>,
         value: Rep3PrimeFieldShare<ark_bn254::Fr>,

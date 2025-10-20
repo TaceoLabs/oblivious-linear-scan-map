@@ -13,7 +13,7 @@ use mpc_net::{
     Network,
     tcp::{NetworkConfig, TcpNetwork},
 };
-use oblivious_linear_scan_map::LinearScanObliviousMap;
+use oblivious_linear_scan_map::{LinearScanObliviousMap, local::LinearScanMap};
 use rand::{CryptoRng, Rng, SeedableRng};
 use rand_chacha::ChaCha12Rng;
 use serde::{Deserialize, Serialize};
@@ -23,10 +23,6 @@ use std::{
     thread::sleep,
     time::{Duration, Instant},
 };
-
-use crate::linear_map::LinearScanMap;
-
-mod linear_map;
 
 const SLEEP: Duration = Duration::from_millis(200);
 
@@ -229,7 +225,7 @@ fn read(
         let stats_before1 = net1.get_connection_stats();
 
         let start = Instant::now();
-        map.read(key, &net0, &net1, randomness, &mut protocol)?;
+        map.oblivious_read(key, &net0, &net1, randomness, &mut protocol)?;
         let duration = start.elapsed().as_micros() as f64;
         times.push(duration);
 

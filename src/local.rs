@@ -4,8 +4,11 @@ use mpc_core::{
     gadgets::poseidon2::Poseidon2,
     protocols::rep3_ring::{self, ring::ring_impl::RingElement},
 };
-use oblivious_linear_scan_map::{Groth16Material, LINEAR_SCAN_TREE_DEPTH, LinearScanObliviousMap};
 use rand::{CryptoRng, Rng};
+
+use crate::{
+    Groth16Material, LINEAR_SCAN_TREE_DEPTH, LinearScanObliviousMap, ObliviousLayer, rep3,
+};
 
 #[derive(Debug, Default, Clone)]
 struct Layer {
@@ -22,10 +25,7 @@ impl Layer {
         self.keys.is_empty()
     }
 
-    pub fn share_ring<R: Rng + CryptoRng>(
-        &self,
-        rng: &mut R,
-    ) -> [oblivious_linear_scan_map::ObliviousLayer; 3] {
+    pub fn share_ring<R: Rng + CryptoRng>(&self, rng: &mut R) -> [ObliviousLayer; 3] {
         debug_assert_eq!(self.keys.len(), self.values.len());
         let keys = self
             .keys
@@ -37,11 +37,11 @@ impl Layer {
             rep3_ring::share_ring_elements_binary(&keys, rng);
 
         let [value_shares0, value_shares1, value_shares2] =
-            oblivious_linear_scan_map::rep3::share_values_ring(&self.values, rng);
+            rep3::share_values_ring(&self.values, rng);
 
-        let res0 = oblivious_linear_scan_map::ObliviousLayer::new(key_shares0, value_shares0);
-        let res1 = oblivious_linear_scan_map::ObliviousLayer::new(key_shares1, value_shares1);
-        let res2 = oblivious_linear_scan_map::ObliviousLayer::new(key_shares2, value_shares2);
+        let res0 = ObliviousLayer::new(key_shares0, value_shares0);
+        let res1 = ObliviousLayer::new(key_shares1, value_shares1);
+        let res2 = ObliviousLayer::new(key_shares2, value_shares2);
 
         [res0, res1, res2]
     }
@@ -87,7 +87,6 @@ impl LinearScanMap {
             }
             layer.keys = keys;
             keys = new_keys;
-            tracing::info!("current size: {current_size}");
             layers.push(layer);
         }
         let mut default_value = ark_bn254::Fr::zero();
