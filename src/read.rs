@@ -1,4 +1,4 @@
-use ark_ff::{One as _, Zero as _};
+use ark_ff::Zero as _;
 use co_noir::{Bn254, Rep3AcvmType};
 use co_noir_to_r1cs::noir::r1cs;
 use co_noir_to_r1cs::trace::MpcTraceHasher;
@@ -12,14 +12,11 @@ use mpc_core::{
             self, Rep3BigUintShare, Rep3PrimeFieldShare, Rep3State, conversion,
             network::Rep3NetworkExt,
         },
-        rep3_ring::{Rep3RingShare, ring::ring_impl::RingElement},
+        rep3_ring::Rep3RingShare,
     },
 };
 
-use crate::{
-    LINEAR_SCAN_TREE_DEPTH, LinearScanObliviousMap, ObliviousMerkleWitnessElement,
-    groth16::Groth16Material,
-};
+use crate::{LINEAR_SCAN_TREE_DEPTH, LinearScanObliviousMap, groth16::Groth16Material};
 
 struct ReadWithTrace {
     read_value: Rep3PrimeFieldShare<ark_bn254::Fr>,
@@ -49,8 +46,13 @@ impl LinearScanObliviousMap {
         state0: &mut Rep3State,
     ) -> eyre::Result<ObliviousReadResult> {
         let path_and_witness = self.read_path_and_witness(key, net0, net1, state0)?;
-        let trace =
-            self.build_read_execution_trace(net0, path_and_witness, randomness_commitment, state0)?;
+        let trace = self.build_read_execution_trace(
+            net0,
+            net1,
+            path_and_witness,
+            randomness_commitment,
+            state0,
+        )?;
         self.groth16_read_proof(net0, net1, trace, state0)
     }
 
@@ -108,10 +110,11 @@ impl LinearScanObliviousMap {
 
     fn build_read_execution_trace<N: Rep3NetworkExt>(
         &self,
-        net: &N,
+        net0: &N,
+        net1: &N,
         path_and_witness: PathAndWitness,
         randomness_commitment: Rep3PrimeFieldShare<ark_bn254::Fr>,
-        state: &mut Rep3State,
+        state0: &mut Rep3State,
     ) -> eyre::Result<ReadWithTrace> {
         let PathAndWitness {
             path,
@@ -128,27 +131,26 @@ impl LinearScanObliviousMap {
         }
 
         let hasher = Poseidon2::<ark_bn254::Fr, 2, 5>::default();
-        let mut hasher_precomputations =
-            hasher.precompute_rep3(LINEAR_SCAN_TREE_DEPTH + 1, net, state)?;
+        let mut state1 = state0.fork(1).expect("cannot fail for rep3");
+        let (mut hasher_precomputations, switches) = std::thread::scope(|s| {
+            let precompute_rep3 =
+                s.spawn(|| hasher.precompute_rep3(LINEAR_SCAN_TREE_DEPTH + 1, net0, state0));
+            debug_assert_eq!(path.len(), witness.len());
+            let hashes = izip!(path.iter(), witness.iter())
+                .map(|(p, w)| w - p)
+                .collect_vec();
+            let switches = rep3::arithmetic::mul_vec(&positions, &hashes, net1, &mut state1)?;
 
-        debug_assert_eq!(path.len(), witness.len());
-        let hashes = izip!(path.iter(), witness.iter())
-            .map(|(p, w)| w - p)
-            .collect_vec();
+            eyre::Ok((precompute_rep3.join().expect("can join")?, switches))
+        })?;
 
-        let switches = rep3::arithmetic::mul_vec(&positions, &hashes, net, state)?;
-
-        let mut merkle_membership = Vec::with_capacity(LINEAR_SCAN_TREE_DEPTH);
         let mut ins = Vec::with_capacity(LINEAR_SCAN_TREE_DEPTH * 2);
-        for (p, w, mul, position) in
-            izip!(path.clone(), witness.clone(), switches, positions.clone())
-        {
+        for (p, w, mul) in izip!(path.clone(), witness.clone(), switches) {
             proof_inputs.push(w.into());
             let hash_left = mul + p;
             let hash_right = w - mul;
             ins.push(hash_left);
             ins.push(hash_right);
-            merkle_membership.push(ObliviousMerkleWitnessElement { other: w, position });
         }
         // Calculate the commitment to the index
         let mut index = Rep3PrimeFieldShare::zero();
@@ -163,7 +165,7 @@ impl LinearScanObliviousMap {
         let (_, traces) = hasher.hash_rep3_generate_noir_trace_many::<_, 33, 66>(
             ins.try_into().expect("works"),
             &mut hasher_precomputations,
-            net,
+            net0,
         )?;
         Ok(ReadWithTrace {
             read_value,

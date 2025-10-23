@@ -2,7 +2,7 @@ use ark_ff::{BigInteger256, One as _, PrimeField, Zero as _};
 
 use itertools::{Itertools as _, izip};
 use mpc_core::{
-    gadgets::poseidon2::{Poseidon2, Poseidon2Precomputations},
+    gadgets::poseidon2::Poseidon2,
     protocols::{
         rep3::{
             Rep3BigUintShare, Rep3PrimeFieldShare, Rep3State, conversion, id::PartyID,
@@ -14,30 +14,21 @@ use mpc_core::{
         },
     },
 };
-use mpc_net::Network;
 
 use crate::rep3::Rep3BigIntShare;
 mod groth16;
 mod insert;
 #[cfg(feature = "local")]
 pub mod local;
-pub mod read;
+mod read;
 pub mod rep3;
 //mod update;
 
 pub use groth16::Groth16Material;
+pub use read::ObliviousReadResult;
 
 pub const DELETED_LEAF_VALUE: u64 = 0xDEADBEEF;
 pub const LINEAR_SCAN_TREE_DEPTH: usize = 32;
-
-#[derive(Clone)]
-/// A witness of proving one layer in a Merkle tree.
-struct ObliviousMerkleWitnessElement {
-    /// Determines the other value required to compute the hash for the next layer.
-    pub other: Rep3PrimeFieldShare<ark_bn254::Fr>,
-    /// Determines the position for the prove element in the hash for current layer.
-    pub position: Rep3PrimeFieldShare<ark_bn254::Fr>, // Index of the prove element
-}
 
 #[derive(Default, Debug, Clone)]
 pub struct ObliviousLayer {
@@ -46,6 +37,7 @@ pub struct ObliviousLayer {
 }
 
 impl ObliviousLayer {
+    #[cfg(feature = "local")]
     pub fn new(keys: Vec<Rep3RingShare<u32>>, values: Vec<Rep3BigIntShare<ark_bn254::Fr>>) -> Self {
         Self { keys, values }
     }
@@ -152,29 +144,6 @@ impl LinearScanObliviousMap {
         conversion::b2a_many(&dots, net, state)
     }
 
-    // finds the path of the member (its neighbors)
-    fn find_path_and_key_decompose(
-        &self,
-        mut needle: Rep3RingShare<u32>,
-    ) -> (Vec<Rep3RingShare<Bit>>, Vec<Rep3RingShare<u32>>) {
-        // To find the path
-        let mut to_compare = Vec::with_capacity(self.total_count);
-        let mut key_bits = Vec::with_capacity(LINEAR_SCAN_TREE_DEPTH);
-        let one = RingElement::one();
-        for layer in self.layers.iter() {
-            let neighbor_key = needle ^ one;
-            for hay in layer.keys.iter() {
-                to_compare.push(hay ^ &neighbor_key);
-            }
-            let lsb = needle.get_bit(0);
-            key_bits.push(lsb);
-
-            needle.a >>= 1;
-            needle.b >>= 1;
-        }
-        (key_bits, to_compare)
-    }
-
     fn dot(
         ohv: &[Rep3RingShare<Bit>],
         other: &[Rep3BigIntShare<ark_bn254::Fr>],
@@ -190,7 +159,7 @@ impl LinearScanObliviousMap {
         // Set the default value:
         // Assuming only one element was a match, we can dot-product the default value with the injected values as well and calculate: other_value + default_value - sum injected_i * default_value.
         let mut offset = state.id == PartyID::ID0;
-        // Start the dot product with a random mask (for potential resharing later)
+        // Start the dot product with a random mask (for potential re-sharing later)
         let (mut dot, dot_b) = state
             .rngs
             .rand
@@ -211,61 +180,6 @@ impl LinearScanObliviousMap {
             dot ^= default;
         }
         dot
-    }
-
-    fn compute_merkle_path<N: Network>(
-        &self,
-        ohv: &[Rep3RingShare<Bit>],
-        bitinject: Vec<Rep3PrimeFieldShare<ark_bn254::Fr>>,
-        net: &N,
-        state: &mut Rep3State,
-    ) -> eyre::Result<Vec<ObliviousMerkleWitnessElement>> {
-        let mut dots_a = Vec::with_capacity(LINEAR_SCAN_TREE_DEPTH);
-        let mut start = 0;
-        for (layer, default) in izip!(self.layers.iter(), self.defaults) {
-            let end = start + layer.keys.len();
-            let dot = Self::dot(&ohv[start..end], &layer.values, default, state);
-            start = end;
-
-            dots_a.push(dot);
-        }
-        let dots_b = net.reshare_many(&dots_a)?;
-
-        let dots = izip!(dots_a, dots_b)
-            .map(|(a, b)| Rep3BigUintShare::new(a.into(), b.into()))
-            .collect_vec();
-
-        let dots = conversion::b2a_many(&dots, net, state)?;
-
-        let path = izip!(dots, bitinject)
-            .map(|(other, position)| ObliviousMerkleWitnessElement { other, position })
-            .collect_vec();
-        Ok(path)
-    }
-
-    fn poseidon2_cmux<N: Network>(
-        p: &ObliviousMerkleWitnessElement,
-        element: Rep3PrimeFieldShare<ark_bn254::Fr>,
-        net: &N,
-        poseidon2: &Poseidon2<ark_bn254::Fr, 2, 5>,
-        poseidon2_precomputations: &mut Poseidon2Precomputations<
-            Rep3PrimeFieldShare<ark_bn254::Fr>,
-        >,
-    ) -> eyre::Result<Rep3PrimeFieldShare<ark_bn254::Fr>> {
-        // left = if p.position == 0 value else other_value
-        // right = if p.position == 0 other_value else value
-        let left_a = (p.other - element) * p.position + element.a;
-        let right_a = (element - p.other) * p.position + p.other.a;
-        let bs = net.reshare_many(&[left_a, right_a])?;
-        let left = Rep3PrimeFieldShare::new(left_a, bs[0]);
-        let right = Rep3PrimeFieldShare::new(right_a, bs[1]);
-        let mut poseidon_inputs = [left, right];
-        poseidon2.rep3_permutation_in_place_with_precomputation(
-            &mut poseidon_inputs,
-            poseidon2_precomputations,
-            net,
-        )?;
-        Ok(poseidon_inputs[0] + left)
     }
 }
 
@@ -437,7 +351,7 @@ mod tests {
                 for (k, v, r) in izip!(key_share0, value_share0, rand_share0) {
                     // read first on key before insert
                     defaults.push(map.oblivious_read(k, &n0, &n3, r, &mut state)?);
-                    inserts.push(map.oblivious_insert(k, v, &n0, &n3, r, r, &mut state)?);
+                    inserts.push(map.oblivious_insert_threads(k, v, &n0, &n3, r, r, &mut state)?);
                     reads.push(map.oblivious_read(k, &n0, &n3, r, &mut state)?);
                 }
                 eyre::Ok((reads, inserts, defaults))
@@ -458,7 +372,7 @@ mod tests {
                 for (k, v, r) in izip!(key_share1, value_share1, rand_share1) {
                     // read first on key before insert
                     defaults.push(map.oblivious_read(k, &n1, &n4, r, &mut state)?);
-                    inserts.push(map.oblivious_insert(k, v, &n1, &n4, r, r, &mut state)?);
+                    inserts.push(map.oblivious_insert_threads(k, v, &n1, &n4, r, r, &mut state)?);
                     reads.push(map.oblivious_read(k, &n1, &n4, r, &mut state)?);
                 }
                 eyre::Ok((reads, inserts, defaults))
@@ -479,7 +393,7 @@ mod tests {
                 for (k, v, r) in izip!(key_share2, value_share2, rand_share2) {
                     // read first on key before insert
                     defaults.push(map.oblivious_read(k, &n2, &n5, r, &mut state)?);
-                    inserts.push(map.oblivious_insert(k, v, &n2, &n5, r, r, &mut state)?);
+                    inserts.push(map.oblivious_insert_threads(k, v, &n2, &n5, r, r, &mut state)?);
                     reads.push(map.oblivious_read(k, &n2, &n5, r, &mut state)?);
                 }
                 eyre::Ok((reads, inserts, defaults))

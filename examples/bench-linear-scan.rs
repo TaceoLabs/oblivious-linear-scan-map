@@ -20,7 +20,6 @@ use serde::{Deserialize, Serialize};
 use std::{
     path::PathBuf,
     process::ExitCode,
-    thread::sleep,
     time::{Duration, Instant},
 };
 
@@ -181,16 +180,17 @@ fn benchmarks<R: Rng + CryptoRng>(config: &Config, rng: &mut R) -> eyre::Result<
     let map = get_random_map(config.num_items, rng);
     let unused_key = map.unused_key(rng);
     let used_key = map.used_key(rng);
-    let _unused_key =
+    let unused_key =
         rep3_ring::share_ring_element_binary(RingElement(unused_key), rng)[config.network.my_id];
 
     let used_key =
         rep3_ring::share_ring_element_binary(RingElement(used_key), rng)[config.network.my_id];
-    let r = rep3::share_field_element(ark_bn254::Fr::rand(rng), rng)[config.network.my_id];
+    let r_idx = rep3::share_field_element(ark_bn254::Fr::rand(rng), rng)[config.network.my_id];
+    let r_value = rep3::share_field_element(ark_bn254::Fr::rand(rng), rng)[config.network.my_id];
 
     tracing::info!("Sharing Map");
     let [map0, map1, map2] = map.share(rng)?;
-    let map = match config.network.my_id {
+    let mut map = match config.network.my_id {
         0 => map0,
         1 => map1,
         2 => map2,
@@ -198,8 +198,9 @@ fn benchmarks<R: Rng + CryptoRng>(config: &Config, rng: &mut R) -> eyre::Result<
     };
 
     tracing::info!("Starting benchmarks");
-    read(&map, used_key, r, config)?;
-    // insert(&map, unused_key, config, rng)?;
+    read(&map, used_key, r_idx, config)?;
+    insert_seq(&mut map, unused_key, r_idx, r_value, config, rng)?;
+    insert_threads(&mut map, unused_key, r_idx, r_value, config, rng)?;
     // update(map, config, rng)?;
 
     Ok(ExitCode::SUCCESS)
@@ -211,226 +212,128 @@ fn read(
     randomness: Rep3PrimeFieldShare<ark_bn254::Fr>,
     config: &Config,
 ) -> eyre::Result<ExitCode> {
+    bench_op(
+        config,
+        format!("Read (d=E2E, n={})", config.num_items),
+        |state, net0, net1| {
+            map.oblivious_read(key, net0, net1, randomness, state)?;
+            Ok(())
+        },
+    )
+}
+pub fn insert_seq<R: Rng + CryptoRng>(
+    map: &mut LinearScanObliviousMap,
+    key: Rep3RingShare<u32>,
+    r_idx: Rep3PrimeFieldShare<ark_bn254::Fr>,
+    r_value: Rep3PrimeFieldShare<ark_bn254::Fr>,
+    config: &Config,
+    rng: &mut R,
+) -> eyre::Result<ExitCode> {
+    // Generate fresh random field element and secret-share locally.
+    let rand_fe = ark_bn254::Fr::rand(rng);
+    let shared = rep3::share_field_element(rand_fe, rng)[config.network.my_id];
+
+    // Capture everything needed inside the closure.
+    bench_op(
+        config,
+        format!("Insert Seq (n={})", config.num_items),
+        |state, net0, net1| {
+            map.oblivious_insert_seq(key, shared, net0, net1, r_idx, r_value, state)?;
+            Ok(())
+        },
+    )
+}
+
+pub fn insert_threads<R: Rng + CryptoRng>(
+    map: &mut LinearScanObliviousMap,
+    key: Rep3RingShare<u32>,
+    r_idx: Rep3PrimeFieldShare<ark_bn254::Fr>,
+    r_value: Rep3PrimeFieldShare<ark_bn254::Fr>,
+    config: &Config,
+    rng: &mut R,
+) -> eyre::Result<ExitCode> {
+    // Generate fresh random field element and secret-share locally.
+    let rand_fe = ark_bn254::Fr::rand(rng);
+    let shared = rep3::share_field_element(rand_fe, rng)[config.network.my_id];
+
+    // Capture everything needed inside the closure.
+    bench_op(
+        config,
+        format!("Insert Threads (n={})", config.num_items),
+        |state, net0, net1| {
+            map.oblivious_insert_threads(key, shared, net0, net1, r_idx, r_value, state)?;
+            Ok(())
+        },
+    )
+}
+pub fn bench_op<F>(config: &Config, label: impl Into<String>, mut op: F) -> eyre::Result<ExitCode>
+where
+    F: FnMut(&mut Rep3State, &TcpNetwork, &TcpNetwork) -> eyre::Result<()>,
+{
+    let label = label.into();
     let mut times = Vec::with_capacity(config.runs);
     let mut send_receive_prev = Vec::with_capacity(config.runs);
     let mut send_receive_next = Vec::with_capacity(config.runs);
 
-    // connect to network
+    // connect once
     let [net0, net1] = TcpNetwork::networks::<2>(config.network.to_owned())?;
-    // init MPC protocol
-    let mut protocol = Rep3State::new(&net0, A2BType::default())?;
+    // init protocol state once
+    let mut state = Rep3State::new(&net0, A2BType::default())?;
 
     for _ in 0..config.runs {
         let stats_before0 = net0.get_connection_stats();
         let stats_before1 = net1.get_connection_stats();
 
         let start = Instant::now();
-        map.oblivious_read(key, &net0, &net1, randomness, &mut protocol)?;
+        op(&mut state, &net0, &net1)?;
         let duration = start.elapsed().as_micros() as f64;
         times.push(duration);
 
+        // gather per-run network deltas
         let stats_after0 = net0.get_connection_stats();
         let stats_after1 = net1.get_connection_stats();
         let mut stats0 = stats_after0.get_diff_to(&stats_before0);
         let stats1 = stats_after1.get_diff_to(&stats_before1);
-        for (key, (x, y)) in stats1 {
+
+        // merge stats1 into stats0
+        for (party, (sent, recv)) in stats1 {
             stats0
-                .entry(key)
-                .and_modify(|(ax, ay)| {
-                    *ax += x;
-                    *ay += y;
+                .entry(party)
+                .and_modify(|(s, r)| {
+                    *s += sent;
+                    *r += recv;
                 })
-                .or_insert((x, y));
+                .or_insert((sent, recv));
         }
 
-        send_receive_prev.push((
-            stats0
-                .get(&(protocol.id.prev() as usize))
-                .expect("invalid party id in stats")
-                .0,
-            stats0
-                .get(&(protocol.id.prev() as usize))
-                .expect("invalid party id in stats")
-                .1,
-        ));
-        send_receive_next.push((
-            stats0
-                .get(&(protocol.id.next() as usize))
-                .expect("invalid party id in stats")
-                .0,
-            stats0
-                .get(&(protocol.id.next() as usize))
-                .expect("invalid party id in stats")
-                .1,
-        ));
+        let prev_id = state.id.prev() as usize;
+        let next_id = state.id.next() as usize;
+
+        let prev_stats = stats0
+            .get(&prev_id)
+            .expect("invalid party id (prev) in stats");
+        let next_stats = stats0
+            .get(&next_id)
+            .expect("invalid party id (next) in stats");
+
+        send_receive_prev.push(*prev_stats);
+        send_receive_next.push(*next_stats);
     }
 
-    sleep(SLEEP);
-    print_runtimes(
-        times,
-        config.network.my_id,
-        &format!("Read (d={}, n={})", "E2E", config.num_items),
-    );
+    std::thread::sleep(SLEEP);
+    print_runtimes(times, config.network.my_id, &label);
     print_data(
         send_receive_next,
         config.network.my_id,
-        protocol.id.next() as usize,
-        &format!("Read (d={}, n={})", "E2E", config.num_items),
+        state.id.next() as usize,
+        &label,
     );
     print_data(
         send_receive_prev,
         config.network.my_id,
-        protocol.id.prev() as usize,
-        &format!("Read (d={}, n={})", "E2E", config.num_items),
+        state.id.prev() as usize,
+        &label,
     );
 
     Ok(ExitCode::SUCCESS)
 }
-
-// fn insert<F: PrimeField, R: Rng + CryptoRng>(
-//     map: &LinearScanObliviousMap<F>,
-//     key: Rep3RingShare<u32>,
-//     config: &Config,
-//     rng: &mut R,
-// ) -> eyre::Result<ExitCode> {
-//     let mut times = Vec::with_capacity(config.runs);
-//     let mut send_receive_prev = Vec::with_capacity(config.runs);
-//     let mut send_receive_next = Vec::with_capacity(config.runs);
-
-//     // connect to network
-//     let net = TcpNetwork::new(config.network.to_owned())?;
-//     // init MPC protocol
-//     let mut protocol = Rep3State::new(&net, A2BType::default())?;
-
-//     for _ in 0..config.runs {
-//         let stats_before = net.get_connection_stats();
-
-//         let mut map_ = map.clone();
-//         let value = F::rand(rng);
-//         let value = rep3::share_field_element(value, rng)[config.network.my_id];
-//         let key_ = key.clone();
-
-//         let start = Instant::now();
-//         map_.insert(key_, value, &net, &mut protocol)?;
-//         let duration = start.elapsed().as_micros() as f64;
-//         times.push(duration);
-
-//         let stats_after = net.get_connection_stats();
-//         let stats = stats_after.get_diff_to(&stats_before);
-
-//         send_receive_prev.push((
-//             stats
-//                 .get(&(protocol.id.prev() as usize))
-//                 .expect("invalid party id in stats")
-//                 .0,
-//             stats
-//                 .get(&(protocol.id.prev() as usize))
-//                 .expect("invalid party id in stats")
-//                 .1,
-//         ));
-//         send_receive_next.push((
-//             stats
-//                 .get(&(protocol.id.next() as usize))
-//                 .expect("invalid party id in stats")
-//                 .0,
-//             stats
-//                 .get(&(protocol.id.next() as usize))
-//                 .expect("invalid party id in stats")
-//                 .1,
-//         ));
-//     }
-
-//     sleep(SLEEP);
-//     print_runtimes(
-//         times,
-//         config.network.my_id,
-//         &format!("Insert (d={}, n={})", config.merkle_depth, config.num_items),
-//     );
-//     print_data(
-//         send_receive_next,
-//         config.network.my_id,
-//         protocol.id.next() as usize,
-//         &format!("Insert (d={}, n={})", config.merkle_depth, config.num_items),
-//     );
-//     print_data(
-//         send_receive_prev,
-//         config.network.my_id,
-//         protocol.id.prev() as usize,
-//         &format!("Insert (d={}, n={})", config.merkle_depth, config.num_items),
-//     );
-
-//     Ok(ExitCode::SUCCESS)
-// }
-
-// fn update<F: PrimeField, R: Rng + CryptoRng>(
-//     mut map: ObliviousMap<F>,
-//     config: &Config,
-//     rng: &mut R,
-// ) -> eyre::Result<ExitCode> {
-//     let mut times = Vec::with_capacity(config.runs);
-//     let mut send_receive_prev = Vec::with_capacity(config.runs);
-//     let mut send_receive_next = Vec::with_capacity(config.runs);
-
-//     // connect to network
-//     let net = TcpNetwork::new(config.network.to_owned())?;
-//     // init MPC protocol
-//     let mut protocol = Rep3State::new(&net, A2BType::default())?;
-
-//     for _ in 0..config.runs {
-//         let stats_before = net.get_connection_stats();
-
-//         let key = map.get_random_allocated_key(rng);
-//         let value = F::rand(rng);
-//         let value = rep3::share_field_element(value, rng)[config.network.my_id];
-
-//         let start = Instant::now();
-//         map.update(&key, value, &net, &mut protocol)?;
-//         let duration = start.elapsed().as_micros() as f64;
-//         times.push(duration);
-
-//         let stats_after = net.get_connection_stats();
-//         let stats = stats_after.get_diff_to(&stats_before);
-
-//         send_receive_prev.push((
-//             stats
-//                 .get(&(protocol.id.prev() as usize))
-//                 .expect("invalid party id in stats")
-//                 .0,
-//             stats
-//                 .get(&(protocol.id.prev() as usize))
-//                 .expect("invalid party id in stats")
-//                 .1,
-//         ));
-//         send_receive_next.push((
-//             stats
-//                 .get(&(protocol.id.next() as usize))
-//                 .expect("invalid party id in stats")
-//                 .0,
-//             stats
-//                 .get(&(protocol.id.next() as usize))
-//                 .expect("invalid party id in stats")
-//                 .1,
-//         ));
-//     }
-
-//     sleep(SLEEP);
-//     print_runtimes(
-//         times,
-//         config.network.my_id,
-//         &format!("Update (d={}, n={})", config.merkle_depth, config.num_items),
-//     );
-//     print_data(
-//         send_receive_next,
-//         config.network.my_id,
-//         protocol.id.next() as usize,
-//         &format!("Update (d={}, n={})", config.merkle_depth, config.num_items),
-//     );
-//     print_data(
-//         send_receive_prev,
-//         config.network.my_id,
-//         protocol.id.prev() as usize,
-//         &format!("Update (d={}, n={})", config.merkle_depth, config.num_items),
-//     );
-
-//     Ok(ExitCode::SUCCESS)
-// }
