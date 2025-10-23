@@ -241,7 +241,7 @@ mod tests {
     use mpc_net::local::LocalNetwork;
     use rand::Rng;
 
-    use crate::rep3::is_zero_many;
+    use crate::mpc::is_zero_many;
 
     #[test]
     fn test_is_zero_all_zeros() {

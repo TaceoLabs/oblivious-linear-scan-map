@@ -5,7 +5,7 @@ use mpc_core::protocols::{
     rep3::rngs::Rep3Rand,
     rep3_ring::{Rep3RingShare, ring::bit::Bit},
 };
-use oblivious_linear_scan_map::rep3::Rep3BigIntShare;
+use oblivious_linear_scan_map::Rep3BigIntShare;
 
 pub fn dot<F: PrimeField>(
     ohv: &[Rep3RingShare<Bit>],

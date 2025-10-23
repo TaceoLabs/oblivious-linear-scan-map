@@ -18,11 +18,10 @@ co-noir-to-r1cs = { version = "0.1.0", git = "https://github.com/TaceoLabs/CoNoi
 eyre = "0.6.12"
 itertools = { version = "0.14" }
 mpc-core = { version = "0.9.0", git = "https://github.com/TaceoLabs/co-snarks", rev = "b8d299289f70c9b0371fa3639ccd133532e74974" }
-mpc-net = { version = "0.4.0", git = "https://github.com/TaceoLabs/co-snarks", rev = "b8d299289f70c9b0371fa3639ccd133532e74974", features = [
-    "local",
-] }
+mpc-net = { version = "0.4.0", git = "https://github.com/TaceoLabs/co-snarks", rev = "b8d299289f70c9b0371fa3639ccd133532e74974", features = ["local"] }
 rand = { version = "0.8" }
 rayon = { version = "1.11" }
+tracing = "0.1.40"
 
 [dev-dependencies]
 clap = { version = "4", features = ["derive", "env"] }
@@ -31,8 +30,7 @@ figment = { version = "0.10.19", features = ["toml", "env"] }
 rand_chacha = "0.3"
 rustls = "0.23"
 serde = { version = "1.0.193", features = ["derive", "rc"] }
-tracing = "0.1.40"
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 
 [[example]]
 name = "bench-linear-scan"

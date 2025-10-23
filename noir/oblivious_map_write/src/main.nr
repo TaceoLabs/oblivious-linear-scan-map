@@ -4,8 +4,8 @@
 fn main(
     old_leaf: Field,
     new_leaf: Field,
-    key_bits: [Field; 40],
-    hash_path: [Field; 40],
+    key_bits: [Field; 32],
+    hash_path: [Field; 32],
     r_index: Field,
     r_value: Field,
 ) -> pub (Field, Field, Field, Field) {

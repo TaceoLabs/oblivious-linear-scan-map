@@ -1,12 +1,18 @@
+// #![deny(missing_docs)]
+//! test
 use ark_ff::{BigInteger256, One as _, PrimeField, Zero as _};
+use ark_groth16::Proof;
+use co_noir_to_r1cs::noir::r1cs;
 
+use co_noir::{Bn254, Rep3AcvmType};
+use co_noir_to_r1cs::trace::MpcTraceHasher as _;
 use itertools::{Itertools as _, izip};
 use mpc_core::{
-    MpcState,
+    MpcState as _,
     gadgets::poseidon2::{Poseidon2, Poseidon2Precomputations},
     protocols::{
         rep3::{
-            Rep3BigUintShare, Rep3PrimeFieldShare, Rep3State, arithmetic, conversion, id::PartyID,
+            Rep3BigUintShare, Rep3PrimeFieldShare, Rep3State, conversion, id::PartyID,
             network::Rep3NetworkExt,
         },
         rep3_ring::{
@@ -15,32 +21,30 @@ use mpc_core::{
         },
     },
 };
-use mpc_net::Network;
+use tracing::instrument;
 
-use crate::rep3::Rep3BigIntShare;
+use crate::{insert::InsertTail, update::UpdateTail};
 mod groth16;
-//mod insert;
+mod insert;
 #[cfg(feature = "local")]
 pub mod local;
-pub mod read;
-pub mod rep3;
-//mod update;
+mod mpc;
+mod read;
+mod update;
 
 pub use groth16::Groth16Material;
+pub use insert::ObliviousInsertRequest;
+pub use insert::ObliviousInsertResult;
+pub use read::ObliviousReadRequest;
+pub use read::ObliviousReadResult;
+pub use update::ObliviousUpdateRequest;
 
-pub const DELETED_LEAF_VALUE: u64 = 0xDEADBEEF;
+pub use mpc::Rep3BigIntShare;
+
+/// The depth of the oblivious-linear-scan-tree.
 pub const LINEAR_SCAN_TREE_DEPTH: usize = 32;
-
-struct NetworkRound1Result<F: PrimeField>(Vec<Rep3RingShare<Bit>>, Vec<Rep3PrimeFieldShare<F>>);
-
-#[derive(Clone)]
-/// A witness of proving one layer in a Merkle tree.
-struct ObliviousMerkleWitnessElement {
-    /// Determines the other value required to compute the hash for the next layer.
-    pub other: Rep3PrimeFieldShare<ark_bn254::Fr>,
-    /// Determines the position for the prove element in the hash for current layer.
-    pub position: Rep3PrimeFieldShare<ark_bn254::Fr>, // Index of the prove element
-}
+const INSERT_PROOF_INPUTS: usize = 68;
+const READ_PROOF_INPUTS: usize = 65;
 
 #[derive(Default, Debug, Clone)]
 pub struct ObliviousLayer {
@@ -48,7 +52,29 @@ pub struct ObliviousLayer {
     values: Vec<Rep3BigIntShare<ark_bn254::Fr>>,
 }
 
+struct PoseidonHashesWithTrace {
+    new_root: Rep3PrimeFieldShare<ark_bn254::Fr>,
+    layer_values: Vec<Rep3PrimeFieldShare<ark_bn254::Fr>>,
+    proof_inputs: Vec<Rep3AcvmType<ark_bn254::Fr>>,
+    traces: Vec<Vec<Rep3AcvmType<ark_bn254::Fr>>>,
+}
+
+struct PoseidonHashesWithTraceInput {
+    new_value: Rep3PrimeFieldShare<ark_bn254::Fr>,
+    old_value: Rep3PrimeFieldShare<ark_bn254::Fr>,
+    bitinject: Vec<Rep3PrimeFieldShare<ark_bn254::Fr>>,
+    merkle_witness: Vec<Rep3PrimeFieldShare<ark_bn254::Fr>>,
+    randomness_index: Rep3PrimeFieldShare<ark_bn254::Fr>,
+    randomness_commitment: Rep3PrimeFieldShare<ark_bn254::Fr>,
+    precompute: Poseidon2Precomputations<Rep3PrimeFieldShare<ark_bn254::Fr>>,
+}
+
+struct PathAndWitness {
+    path: Vec<Rep3PrimeFieldShare<ark_bn254::Fr>>,
+    witness: Vec<Rep3PrimeFieldShare<ark_bn254::Fr>>,
+}
 impl ObliviousLayer {
+    #[cfg(feature = "local")]
     pub fn new(keys: Vec<Rep3RingShare<u32>>, values: Vec<Rep3BigIntShare<ark_bn254::Fr>>) -> Self {
         Self { keys, values }
     }
@@ -61,16 +87,18 @@ pub struct LinearScanObliviousMap {
     defaults: [BigInteger256; LINEAR_SCAN_TREE_DEPTH],
     root: ark_bn254::Fr,
     read_groth16: Groth16Material,
+    write_groth16: Groth16Material,
 }
 
 impl LinearScanObliviousMap {
-    pub fn new(read_groth16: Groth16Material) -> Self {
-        Self::with_default_value(ark_bn254::Fr::zero(), read_groth16)
+    pub fn new(read_groth16: Groth16Material, write_groth16: Groth16Material) -> Self {
+        Self::with_default_value(ark_bn254::Fr::zero(), read_groth16, write_groth16)
     }
 
     pub fn with_default_value(
         mut default_value: ark_bn254::Fr,
         read_groth16: Groth16Material,
+        write_groth16: Groth16Material,
     ) -> Self {
         let poseidon2 = Poseidon2::<ark_bn254::Fr, 2, 5>::default();
         let defaults = std::array::from_fn(|_| {
@@ -85,9 +113,11 @@ impl LinearScanObliviousMap {
             defaults,
             root: default_value,
             read_groth16,
+            write_groth16,
         }
     }
 
+    #[cfg(feature = "local")]
     pub fn from_shared_values(
         layers: [ObliviousLayer; LINEAR_SCAN_TREE_DEPTH],
         leaf_count: usize,
@@ -95,6 +125,7 @@ impl LinearScanObliviousMap {
         defaults: [BigInteger256; LINEAR_SCAN_TREE_DEPTH],
         root: ark_bn254::Fr,
         read_groth16: Groth16Material,
+        write_groth16: Groth16Material,
     ) -> Self {
         Self {
             layers,
@@ -103,6 +134,7 @@ impl LinearScanObliviousMap {
             defaults,
             root,
             read_groth16,
+            write_groth16,
         }
     }
 
@@ -111,59 +143,340 @@ impl LinearScanObliviousMap {
         LINEAR_SCAN_TREE_DEPTH
     }
 
-    // pub(crate) fn verify_path<N: Network>(
-    //     &self,
-    //     element: Rep3PrimeFieldShare<ark_bn254::Fr>,
-    //     path: &ObliviousMembershipProof,
-    //     net: &N,
-    //     state: &mut Rep3State,
-    // ) -> eyre::Result<Rep3RingShare<Bit>> {
-    //     let poseidon2 = Poseidon2::<ark_bn254::Fr, 2, 5>::default();
-    //     let mut poseidon2_precomputations =
-    //         poseidon2.precompute_rep3(LINEAR_SCAN_TREE_DEPTH, net, state)?;
+    #[expect(clippy::too_many_arguments)]
+    pub fn oblivious_insert_or_update<N: Rep3NetworkExt>(
+        &mut self,
+        key: Rep3RingShare<u32>,
+        insert_value: Rep3PrimeFieldShare<ark_bn254::Fr>,
+        net0: &N,
+        net1: &N,
+        randomness_index: Rep3PrimeFieldShare<ark_bn254::Fr>,
+        randomness_commitment: Rep3PrimeFieldShare<ark_bn254::Fr>,
+        state0: &mut Rep3State,
+    ) -> eyre::Result<()> {
+        // we need to check if the value is present in the leaf layer.
+        // we do that by computing the ohv of the path and xor the leaf values.
+        let mut state1 = state0.fork(1).expect("cant fail for rep3");
 
-    //     let mut current_value = element;
-    //     for p in path.0.iter() {
-    //         current_value = Self::poseidon2_cmux(
-    //             p,
-    //             current_value,
-    //             net,
-    //             &poseidon2,
-    //             &mut poseidon2_precomputations,
-    //         )?;
-    //     }
-    //     // current_value == self.root
-    //     let eq = arithmetic::eq_bit_public(current_value, self.root, net, state)?;
+        let ((present_bit, path_ohv), (merkle_witness, bitinject)) = Self::join(
+            || self.is_value_in_leaves(key, net0, state0),
+            || {
+                let merkle_witness = self.read_merkle_witness(key, net1, &mut state1)?;
+                let bitinject = Self::key_decompose(key, net1, &mut state1)?;
+                Ok((merkle_witness, bitinject))
+            },
+        )?;
+        if present_bit {
+            // is present - need to update
+            let update_tail = UpdateTail {
+                update_value: insert_value,
+                path_ohv,
+                merkle_witness,
+                bitinject,
+                randomness_index,
+                randomness_commitment,
+            };
+            self.update_tail(update_tail, net0, net1, state0, &mut state1)?;
+        } else {
+            // not present - need to insert
+            let insert_tail = InsertTail {
+                key,
+                insert_value,
+                path_ohv,
+                merkle_witness,
+                bitinject,
+                randomness_index,
+                randomness_commitment,
+            };
+            self.insert_tail(insert_tail, net0, net1, state0)?;
+        }
+        Ok(())
+    }
 
-    //     // Translate to BitShare
-    //     let eq = Rep3RingShare::<Bit>::new(eq.a.bit(0).into(), eq.b.bit(0).into());
+    fn join<F0, T0, F1, T1>(f0: F0, f1: F1) -> eyre::Result<(T0, T1)>
+    where
+        F0: FnOnce() -> eyre::Result<T0> + Send,
+        T0: Send,
+        F1: FnOnce() -> eyre::Result<T1> + Send,
+        T1: Send,
+    {
+        std::thread::scope(|s| {
+            let s0 = s.spawn(f1);
+            eyre::Ok((f0()?, s0.join().expect("can join")?))
+        })
+    }
 
-    //     Ok(eq)
-    // }
+    fn push_new_values(&mut self, values: Vec<Rep3BigUintShare<ark_bn254::Fr>>) {
+        for (layer, new_value) in izip!(self.layers.iter_mut(), values) {
+            layer.values.push(new_value.try_into().expect("Works"));
+        }
+    }
 
-    // finds the path of the member (its neighbors)
-    fn find_path_and_key_decompose(
+    fn is_value_in_leaves<N: Rep3NetworkExt>(
         &self,
-        mut needle: Rep3RingShare<u32>,
-    ) -> (Vec<Rep3RingShare<Bit>>, Vec<Rep3RingShare<u32>>) {
-        // To find the path
-        let mut to_compare = Vec::with_capacity(self.total_count);
-        let mut key_bits = Vec::with_capacity(LINEAR_SCAN_TREE_DEPTH);
+        key: Rep3RingShare<u32>,
+        net: &N,
+        state: &mut Rep3State,
+    ) -> eyre::Result<(bool, Vec<Rep3RingShare<Bit>>)> {
+        let path_ohv = crate::mpc::is_zero_many(self.find_path(key), net, state)?;
+        let present_bit = path_ohv[..self.layers[0].values.len()]
+            .iter()
+            .fold(Rep3RingShare::zero_share(), |acc, x| acc ^ *x);
+        // open the present bit
+        let other = net.reshare(present_bit.b)?;
+        let present_bit = other + present_bit.a + present_bit.b;
+        Ok((present_bit.convert().convert(), path_ohv))
+    }
+
+    #[instrument(level = "debug", skip_all)]
+    fn key_decompose<N: Rep3NetworkExt>(
+        key: Rep3RingShare<u32>,
+        net: &N,
+        state: &mut Rep3State,
+    ) -> eyre::Result<Vec<Rep3PrimeFieldShare<ark_bn254::Fr>>> {
+        let key_bits = (0..32).map(|shift| (key >> shift).get_bit(0)).collect_vec();
+        // also do the bitinject
+        crate::mpc::bit_inject_from_bits_to_field_many(&key_bits, net, state)
+    }
+
+    /// Computes a co-SNARK with the provided [`Groth16Material`]. The traces for the poseidon hashes
+    /// need to be computed in advance.
+    fn co_snark<N: Rep3NetworkExt>(
+        inputs: Vec<Rep3AcvmType<ark_bn254::Fr>>,
+        traces: Vec<Vec<Rep3AcvmType<ark_bn254::Fr>>>,
+        groth16_material: &Groth16Material,
+        net0: &N,
+        net1: &N,
+        state0: &mut Rep3State,
+    ) -> eyre::Result<(Proof<Bn254>, Vec<ark_bn254::Fr>)> {
+        let Groth16Material {
+            proof_schema,
+            cs,
+            pk,
+        } = groth16_material;
+        let r1cs = r1cs::trace_to_r1cs_witness(inputs, traces, proof_schema, net0, net1, state0)?;
+        let witness = r1cs::r1cs_witness_to_cogroth16(proof_schema, r1cs, state0.id);
+        let (proof, public_inputs) = r1cs::prove(cs, pk, witness, net0, net1)?;
+        tracing::trace!("< groth16 read proof");
+        Ok((proof, public_inputs))
+    }
+
+    /// Computes the poseidon hashes for inserts/updates.
+    ///
+    /// In contrast to read, we can't compute all hashes in parallel.
+    /// This method recomputes the hashes for the old root and the new root.
+    ///
+    /// The very first round also computes the hashes for the commitment to safe a Poseidon2-depth.
+    #[instrument(level = "debug", skip_all)]
+    fn poseidon_hashes_with_write_traces<N: Rep3NetworkExt>(
+        input: PoseidonHashesWithTraceInput,
+        net: &N,
+    ) -> eyre::Result<PoseidonHashesWithTrace> {
+        let PoseidonHashesWithTraceInput {
+            new_value,
+            old_value,
+            bitinject,
+            merkle_witness,
+            randomness_index,
+            randomness_commitment,
+            mut precompute,
+        } = input;
+        let mut proof_inputs = Vec::with_capacity(LINEAR_SCAN_TREE_DEPTH);
+        let mut layer_values = Vec::with_capacity(LINEAR_SCAN_TREE_DEPTH);
+        let mut traces_new_root = Vec::with_capacity(LINEAR_SCAN_TREE_DEPTH);
+        let mut traces_old_root = Vec::with_capacity(LINEAR_SCAN_TREE_DEPTH);
+        layer_values.push(new_value);
+
+        let mut current_value_new = new_value;
+        let mut current_value_old = old_value;
+
+        // in the first run we also do the poseidon hashes for the two commitments
+
+        // Calculate the commitment to the index
+        let mut index = Rep3PrimeFieldShare::zero();
+        for p in bitinject.iter().rev() {
+            index += index;
+            index += p;
+        }
+
+        let [left_new, right_new, left_old, right_old] = prep_poseidon(
+            merkle_witness[0],
+            current_value_new,
+            current_value_old,
+            bitinject[0],
+            net,
+        )?;
+        let ins = [
+            left_new,
+            right_new,
+            left_old,
+            right_old,
+            index,
+            randomness_index,
+            new_value,
+            randomness_commitment,
+        ];
+        let poseidon2 = Poseidon2::<ark_bn254::Fr, 2, 5>::default();
+        let (hashes, traces) =
+            poseidon2.hash_rep3_generate_noir_trace_many::<_, 4, 8>(ins, &mut precompute, net)?;
+        let [new_trace, old_trace, index_trace, value_trace] = traces;
+        proof_inputs.push(Rep3AcvmType::from(merkle_witness[0]));
+        layer_values.push(hashes[0]);
+        traces_new_root.push(new_trace);
+        traces_old_root.push(old_trace);
+        current_value_new = hashes[0];
+        current_value_old = hashes[1];
+
+        // Hashes for the rest of the tree.
+        for (other, position) in izip!(merkle_witness, bitinject.clone()).skip(1) {
+            let input = prep_poseidon(other, current_value_new, current_value_old, position, net)?;
+
+            let (hashes, trace) = poseidon2.hash_rep3_generate_noir_trace_many::<_, 2, 4>(
+                input,
+                &mut precompute,
+                net,
+            )?;
+            let [new_trace, old_trace] = trace;
+            proof_inputs.push(Rep3AcvmType::from(other));
+            layer_values.push(hashes[0]);
+            traces_new_root.push(new_trace);
+            traces_old_root.push(old_trace);
+            current_value_new = hashes[0];
+            current_value_old = hashes[1];
+        }
+        proof_inputs.push(Rep3AcvmType::from(randomness_index));
+        proof_inputs.push(Rep3AcvmType::from(randomness_commitment));
+        traces_old_root.extend(traces_new_root);
+        traces_old_root.push(index_trace);
+        traces_old_root.push(value_trace);
+        Ok(PoseidonHashesWithTrace {
+            new_root: current_value_new,
+            layer_values,
+            proof_inputs,
+            traces: traces_old_root,
+        })
+    }
+
+    fn promote_default_value<N: Rep3NetworkExt>(
+        &self,
+        net: &N,
+    ) -> Rep3PrimeFieldShare<ark_bn254::Fr> {
+        let party_id = net.id().try_into().expect("works for rep3 network");
+
+        mpc_core::protocols::rep3::arithmetic::promote_to_trivial_share(
+            party_id,
+            self.defaults[0].into(),
+        )
+    }
+
+    fn find_witness(&self, mut needle: Rep3RingShare<u32>) -> Vec<Rep3RingShare<u32>> {
+        // To find the witness
+        let mut path_ohv = Vec::with_capacity(self.total_count);
         let one = RingElement::one();
         for layer in self.layers.iter() {
             let neighbor_key = needle ^ one;
             for hay in layer.keys.iter() {
-                to_compare.push(hay ^ &neighbor_key);
+                path_ohv.push(hay ^ &neighbor_key);
             }
-            let lsb = needle.get_bit(0);
-            key_bits.push(lsb);
 
             needle.a >>= 1;
             needle.b >>= 1;
         }
-        (key_bits, to_compare)
+        path_ohv
     }
 
+    fn find_path(&self, mut needle: Rep3RingShare<u32>) -> Vec<Rep3RingShare<u32>> {
+        // To find the path
+        let mut result = Vec::with_capacity(self.total_count);
+        for layer in self.layers.iter() {
+            for hay in layer.keys.iter() {
+                result.push(hay ^ &needle);
+            }
+            needle.a >>= 1;
+            needle.b >>= 1;
+        }
+        result
+    }
+
+    fn read_merkle_path<N: Rep3NetworkExt>(
+        &self,
+        key: Rep3RingShare<u32>,
+        net: &N,
+        state: &mut Rep3State,
+    ) -> eyre::Result<Vec<Rep3PrimeFieldShare<ark_bn254::Fr>>> {
+        let path_ohv = crate::mpc::is_zero_many(self.find_path(key), net, state)?;
+        self.read_from_layers_with_ohv(&path_ohv, net, state)
+    }
+
+    fn read_merkle_witness<N: Rep3NetworkExt>(
+        &self,
+        key: Rep3RingShare<u32>,
+        net: &N,
+        state: &mut Rep3State,
+    ) -> eyre::Result<Vec<Rep3PrimeFieldShare<ark_bn254::Fr>>> {
+        let path_ohv = crate::mpc::is_zero_many(self.find_witness(key), net, state)?;
+        self.read_from_layers_with_ohv(&path_ohv, net, state)
+    }
+
+    #[instrument(level = "debug", skip_all)]
+    fn read_path_and_witness<N: Rep3NetworkExt>(
+        &self,
+        key: Rep3RingShare<u32>,
+        net0: &N,
+        net1: &N,
+        state0: &mut Rep3State,
+        state1: &mut Rep3State,
+    ) -> eyre::Result<PathAndWitness> {
+        tracing::trace!("> reading path and witness...");
+        let (path, witness) = Self::join(
+            || self.read_merkle_path(key, net0, state0),
+            || self.read_merkle_witness(key, net1, state1),
+        )?;
+        tracing::trace!("< reading path and witness...");
+        Ok(PathAndWitness { path, witness })
+    }
+
+    fn read_from_layers_with_ohv<N: Rep3NetworkExt>(
+        &self,
+        ohv: &[Rep3RingShare<Bit>],
+        net: &N,
+        state: &mut Rep3State,
+    ) -> eyre::Result<Vec<Rep3PrimeFieldShare<ark_bn254::Fr>>> {
+        let mut dots_a = Vec::with_capacity(LINEAR_SCAN_TREE_DEPTH);
+        let mut start = 0;
+        for (layer, default) in izip!(self.layers.iter(), self.defaults.into_iter()) {
+            let end = start + layer.keys.len();
+            let dot = Self::dot(&ohv[start..end], &layer.values, default, state);
+            start = end;
+            dots_a.push(dot);
+        }
+        let dots_b = net.reshare_many(&dots_a)?;
+        let dots = izip!(dots_a, dots_b)
+            .map(|(a, b)| Rep3BigUintShare::<ark_bn254::Fr>::new(a.into(), b.into()))
+            .collect_vec();
+
+        conversion::b2a_many(&dots, net, state)
+    }
+
+    fn read_from_leaf_layer<N: Rep3NetworkExt>(
+        &self,
+        ohv: &[Rep3RingShare<Bit>],
+        net: &N,
+        state: &mut Rep3State,
+    ) -> eyre::Result<Rep3PrimeFieldShare<ark_bn254::Fr>> {
+        let leaf_layer = &self.layers[0];
+
+        let dot_a = Self::dot(
+            &ohv[..leaf_layer.keys.len()],
+            &leaf_layer.values,
+            self.defaults[0],
+            state,
+        );
+        let dot_b = net.reshare(dot_a)?;
+        let dot = Rep3BigUintShare::<ark_bn254::Fr>::new(dot_a.into(), dot_b.into());
+
+        conversion::b2a(&dot, net, state)
+    }
     fn dot(
         ohv: &[Rep3RingShare<Bit>],
         other: &[Rep3BigIntShare<ark_bn254::Fr>],
@@ -179,7 +492,7 @@ impl LinearScanObliviousMap {
         // Set the default value:
         // Assuming only one element was a match, we can dot-product the default value with the injected values as well and calculate: other_value + default_value - sum injected_i * default_value.
         let mut offset = state.id == PartyID::ID0;
-        // Start the dot product with a random mask (for potential resharing later)
+        // Start the dot product with a random mask (for potential re-sharing later)
         let (mut dot, dot_b) = state
             .rngs
             .rand
@@ -201,95 +514,41 @@ impl LinearScanObliviousMap {
         }
         dot
     }
-
-    fn network_round1<N: Rep3NetworkExt>(
-        key_bits: &[Rep3RingShare<Bit>],
-        to_compare: Vec<Rep3RingShare<u32>>,
-        net0: &N,
-        net1: &N,
-        state0: &mut Rep3State,
-    ) -> eyre::Result<NetworkRound1Result<ark_bn254::Fr>> {
-        let mut state1 = state0.fork(1).expect("Rep3 fork cannot fail");
-        let (ohv_layer, bitinject) = std::thread::scope(|s| {
-            let ohv_layer = s.spawn(|| crate::rep3::is_zero_many(to_compare, net0, state0));
-            let bitinject = s.spawn(|| {
-                crate::rep3::bit_inject_from_bits_to_field_many(key_bits, net1, &mut state1)
-            });
-            (
-                ohv_layer.join().expect("can join"),
-                bitinject.join().expect("can join"),
-            )
-        });
-
-        let ohv_layer = ohv_layer?;
-        let bitinject = bitinject?;
-        Ok(NetworkRound1Result(ohv_layer, bitinject))
-    }
-
-    fn compute_merkle_path<N: Network>(
-        &self,
-        ohv: &[Rep3RingShare<Bit>],
-        bitinject: Vec<Rep3PrimeFieldShare<ark_bn254::Fr>>,
-        net: &N,
-        state: &mut Rep3State,
-    ) -> eyre::Result<Vec<ObliviousMerkleWitnessElement>> {
-        let mut dots_a = Vec::with_capacity(LINEAR_SCAN_TREE_DEPTH);
-        let mut start = 0;
-        for (layer, default) in izip!(self.layers.iter(), self.defaults) {
-            let end = start + layer.keys.len();
-            let dot = Self::dot(&ohv[start..end], &layer.values, default, state);
-            start = end;
-
-            dots_a.push(dot);
-        }
-        let dots_b = net.reshare_many(&dots_a)?;
-
-        let dots = izip!(dots_a, dots_b)
-            .map(|(a, b)| Rep3BigUintShare::new(a.into(), b.into()))
-            .collect_vec();
-
-        let dots = conversion::b2a_many(&dots, net, state)?;
-
-        let path = izip!(dots, bitinject)
-            .map(|(other, position)| ObliviousMerkleWitnessElement { other, position })
-            .collect_vec();
-        Ok(path)
-    }
-
-    fn poseidon2_cmux<N: Network>(
-        p: &ObliviousMerkleWitnessElement,
-        element: Rep3PrimeFieldShare<ark_bn254::Fr>,
-        net: &N,
-        poseidon2: &Poseidon2<ark_bn254::Fr, 2, 5>,
-        poseidon2_precomputations: &mut Poseidon2Precomputations<
-            Rep3PrimeFieldShare<ark_bn254::Fr>,
-        >,
-    ) -> eyre::Result<Rep3PrimeFieldShare<ark_bn254::Fr>> {
-        // left = if p.position == 0 value else other_value
-        // right = if p.position == 0 other_value else value
-        let left_a = (p.other - element) * p.position + element.a;
-        let right_a = (element - p.other) * p.position + p.other.a;
-        let bs = net.reshare_many(&[left_a, right_a])?;
-        let left = Rep3PrimeFieldShare::new(left_a, bs[0]);
-        let right = Rep3PrimeFieldShare::new(right_a, bs[1]);
-        let mut poseidon_inputs = [left, right];
-        poseidon2.rep3_permutation_in_place_with_precomputation(
-            &mut poseidon_inputs,
-            poseidon2_precomputations,
-            net,
-        )?;
-        Ok(poseidon_inputs[0] + left)
-    }
 }
 
+fn oblivious_switch(
+    lhs: Rep3PrimeFieldShare<ark_bn254::Fr>,
+    rhs: Rep3PrimeFieldShare<ark_bn254::Fr>,
+    selector: Rep3PrimeFieldShare<ark_bn254::Fr>,
+) -> (ark_bn254::Fr, ark_bn254::Fr) {
+    let left_a = (lhs - rhs) * selector + rhs.a;
+    let right_a = (rhs - lhs) * selector + lhs.a;
+    (left_a, right_a)
+}
+
+/// Prepares the inputs for the two hashes used to compute the root for a specific layer.
+/// Depending on position we need to decide whether we need to put the values as left or right input to Poseidon2.
+///
+/// This method performs this switch.
+fn prep_poseidon<N: Rep3NetworkExt>(
+    other: Rep3PrimeFieldShare<ark_bn254::Fr>,
+    current_value_new: Rep3PrimeFieldShare<ark_bn254::Fr>,
+    current_value_old: Rep3PrimeFieldShare<ark_bn254::Fr>,
+    position: Rep3PrimeFieldShare<ark_bn254::Fr>,
+    net: &N,
+) -> eyre::Result<[Rep3PrimeFieldShare<ark_bn254::Fr>; 4]> {
+    let (new_left, new_right) = oblivious_switch(other, current_value_new, position);
+    let (old_left, old_right) = oblivious_switch(other, current_value_old, position);
+    let bs = net.reshare_many(&[new_left, new_right, old_left, old_right])?;
+    let left_new = Rep3PrimeFieldShare::new(new_left, bs[0]);
+    let right_new = Rep3PrimeFieldShare::new(new_right, bs[1]);
+    let left_old = Rep3PrimeFieldShare::new(old_left, bs[2]);
+    let right_old = Rep3PrimeFieldShare::new(old_right, bs[3]);
+    Ok([left_new, right_new, left_old, right_old])
+}
 #[cfg(test)]
 mod tests {
     use co_noir_to_r1cs::noir::{r1cs, ultrahonk};
-    use mpc_core::protocols::{
-        rep3::{self, Rep3State, conversion::A2BType},
-        rep3_ring::{self, ring::ring_impl::RingElement},
-    };
-    use mpc_net::local::LocalNetwork;
     use std::str::FromStr;
 
     use crate::{LinearScanObliviousMap, groth16::Groth16Material};
@@ -297,426 +556,30 @@ mod tests {
     const DEFAULT_ROOT_BN254_FR: &str =
         "20656661903863297823367476705363945647184478890034741500819882513030138045548";
 
-    #[test]
-    fn defaults_correct() -> eyre::Result<()> {
+    pub fn groth16_material() -> eyre::Result<(Groth16Material, Groth16Material)> {
         let root = std::env!("CARGO_MANIFEST_DIR");
         let read_program = ultrahonk::get_program_artifact(format!(
             "{root}/noir/compiled_circuits/oblivious_map_read.json"
         ))?;
-        let (proof_schema, pk, cs) = r1cs::setup_r1cs(read_program, &mut rand::thread_rng())?;
+        let write_program = ultrahonk::get_program_artifact(format!(
+            "{root}/noir/compiled_circuits/oblivious_map_write.json"
+        ))?;
+        let (proof_schema_read, pk_read, cs_read) =
+            r1cs::setup_r1cs(read_program, &mut rand::thread_rng())?;
+        let (proof_schema_write, pk_write, cs_write) =
+            r1cs::setup_r1cs(write_program, &mut rand::thread_rng())?;
+        Ok((
+            Groth16Material::new(proof_schema_read, cs_read, pk_read),
+            Groth16Material::new(proof_schema_write, cs_write, pk_write),
+        ))
+    }
 
-        let is_root = LinearScanObliviousMap::new(Groth16Material::new(proof_schema, cs, pk)).root;
+    #[test]
+    fn defaults_correct() -> eyre::Result<()> {
+        let (read_groth16, write_groth16) = groth16_material()?;
+        let is_root = LinearScanObliviousMap::new(read_groth16, write_groth16).root;
         let should_root = ark_bn254::Fr::from_str(DEFAULT_ROOT_BN254_FR).expect("works");
         assert_eq!(is_root, should_root);
         Ok(())
     }
-
-    #[test]
-    fn read_empty_map() -> eyre::Result<()> {
-        let mut rng = rand::thread_rng();
-
-        // generate a random key
-        let key = RingElement(rand::random::<u32>());
-        let randomness_commitment = ark_bn254::Fr::from(rand::random::<u128>());
-
-        let [key_share0, key_share1, key_share2] =
-            rep3_ring::share_ring_element_binary(key, &mut rng);
-
-        let [r0, r1, r2] = rep3::share_field_element(randomness_commitment, &mut rng);
-
-        // need two networks
-        let [n0, n1, n2] = LocalNetwork::new_3_parties();
-        let [n3, n4, n5] = LocalNetwork::new_3_parties();
-        let random_default_value = ark_bn254::Fr::from(rand::random::<u128>());
-
-        let root = std::env!("CARGO_MANIFEST_DIR");
-        let read_program = ultrahonk::get_program_artifact(format!(
-            "{root}/noir/compiled_circuits/oblivious_map_read.json"
-        ))?;
-        let (proof_schema, pk, cs) = r1cs::setup_r1cs(read_program, &mut rand::thread_rng())?;
-        let read_material0 = Groth16Material::new(proof_schema, cs, pk.clone());
-        let read_material1 = read_material0.clone();
-        let read_material2 = read_material0.clone();
-
-        let [res0, res1, res2] = std::thread::scope(|s| {
-            let res0 = s.spawn(|| {
-                let map = LinearScanObliviousMap::with_default_value(
-                    random_default_value,
-                    read_material0,
-                );
-                let mut state = Rep3State::new(&n0, A2BType::Direct).expect("works");
-                let read_value = map.oblivious_read(key_share0, &n0, &n3, r0, &mut state)?;
-                eyre::Ok(read_value)
-            });
-
-            let res1 = s.spawn(|| {
-                let map = LinearScanObliviousMap::with_default_value(
-                    random_default_value,
-                    read_material1,
-                );
-                let mut state = Rep3State::new(&n1, A2BType::Direct).expect("works");
-                map.oblivious_read(key_share1, &n1, &n4, r1, &mut state)
-            });
-
-            let res2 = s.spawn(|| {
-                let map = LinearScanObliviousMap::with_default_value(
-                    random_default_value,
-                    read_material2,
-                );
-                let mut state = Rep3State::new(&n2, A2BType::Direct).expect("works");
-                map.oblivious_read(key_share2, &n2, &n5, r2, &mut state)
-            });
-            let res0 = res0.join().expect("can join").expect("did work");
-            let res1 = res1.join().expect("can join").expect("did work");
-            let res2 = res2.join().expect("can join").expect("did work");
-            [res0, res1, res2]
-        });
-
-        let read_value = (res0.read + res1.read + res2.read).a;
-        assert_eq!(read_value, random_default_value);
-
-        // verify the proofs
-        assert!(r1cs::verify(&pk.vk, &res0.proof, &res0.public_inputs)?);
-        assert!(r1cs::verify(&pk.vk, &res1.proof, &res1.public_inputs)?);
-        assert!(r1cs::verify(&pk.vk, &res2.proof, &res2.public_inputs)?);
-
-        Ok(())
-    }
-
-    // #[test]
-    // fn insert_then_read() {
-    //     const TEST_SUITE: usize = 100;
-    //     let mut rng = rand::thread_rng();
-
-    //     // generate a random key/values
-    //     let mut keys = Vec::with_capacity(TEST_SUITE);
-    //     let mut values = Vec::with_capacity(TEST_SUITE);
-    //     for _ in 0..TEST_SUITE {
-    //         let mut key = rand::random::<RingElement<u32>>();
-    //         while keys.contains(&key) {
-    //             key = rand::random::<RingElement<u32>>();
-    //         }
-    //         keys.push(key);
-    //         values.push(ark_bn254::Fr::from(rand::random::<u128>()));
-    //     }
-
-    //     let [key_share0, key_share1, key_share2] =
-    //         rep3_ring::share_ring_elements_binary(&keys, &mut rng);
-    //     let [value_share0, value_share1, value_share2] =
-    //         rep3::share_field_elements(&values, &mut rng);
-
-    //     // need two networks
-    //     let [n0, n1, n2] = LocalNetwork::new_3_parties();
-    //     let [n3, n4, n5] = LocalNetwork::new_3_parties();
-    //     let random_default_value = ark_bn254::Fr::from(rand::random::<u128>());
-
-    //     let [res0, res1, res2] = std::thread::scope(|s| {
-    //         let res0 = s.spawn(|| {
-    //             let mut map = LinearScanObliviousMap::with_default_value(random_default_value);
-    //             let mut state = Rep3State::new(&n0, A2BType::Direct).expect("works");
-    //             let mut reads = Vec::with_capacity(TEST_SUITE);
-    //             let mut defaults = Vec::with_capacity(TEST_SUITE);
-
-    //             for (k, v) in izip!(key_share0, value_share0) {
-    //                 // read first on key before insert
-    //                 defaults.push(map.read_path_and_witness(k, &n0, &n3, &mut state)?.path[0]);
-    //                 map.insert(k, v, &n0, &n3, &mut state)?;
-    //                 reads.push(map.read_path_and_witness(k, &n0, &n3, &mut state)?.path[0]);
-    //             }
-    //             eyre::Ok((reads, defaults))
-    //         });
-
-    //         let res1 = s.spawn(|| {
-    //             let mut map = LinearScanObliviousMap::with_default_value(random_default_value);
-    //             let mut state = Rep3State::new(&n1, A2BType::Direct).expect("works");
-    //             let mut reads = Vec::with_capacity(TEST_SUITE);
-    //             let mut defaults = Vec::with_capacity(TEST_SUITE);
-
-    //             for (k, v) in izip!(key_share1, value_share1) {
-    //                 // read first on key before insert
-    //                 defaults.push(map.read_path_and_witness(k, &n1, &n4, &mut state)?.path[0]);
-    //                 map.insert(k, v, &n1, &n4, &mut state)?;
-    //                 reads.push(map.read_path_and_witness(k, &n1, &n4, &mut state)?.path[0]);
-    //             }
-    //             eyre::Ok((reads, defaults))
-    //         });
-
-    //         let res2 = s.spawn(|| {
-    //             let mut map = LinearScanObliviousMap::with_default_value(random_default_value);
-    //             let mut state = Rep3State::new(&n2, A2BType::Direct).expect("works");
-    //             let mut reads = Vec::with_capacity(TEST_SUITE);
-    //             let mut defaults = Vec::with_capacity(TEST_SUITE);
-
-    //             for (k, v) in izip!(key_share2, value_share2) {
-    //                 // read first on key before insert
-    //                 defaults.push(map.read_path_and_witness(k, &n2, &n5, &mut state)?.path[0]);
-    //                 map.insert(k, v, &n2, &n5, &mut state)?;
-    //                 reads.push(map.read_path_and_witness(k, &n2, &n5, &mut state)?.path[0]);
-    //             }
-    //             eyre::Ok((reads, defaults))
-    //         });
-    //         let res0 = res0.join().expect("can join").expect("did work");
-    //         let res1 = res1.join().expect("can join").expect("did work");
-    //         let res2 = res2.join().expect("can join").expect("did work");
-    //         [res0, res1, res2]
-    //     });
-
-    //     let (reads0, defaults0) = res0;
-    //     let (reads1, defaults1) = res1;
-    //     let (reads2, defaults2) = res2;
-
-    //     for (d0, d1, d2) in izip!(defaults0, defaults1, defaults2) {
-    //         assert_eq!((d0 + d1 + d2).a, random_default_value);
-    //     }
-
-    //     for (r0, r1, r2, should) in izip!(reads0, reads1, reads2, values) {
-    //         assert_eq!((r0 + r1 + r2).a, should);
-    //     }
-    // }
-
-    // #[test]
-    // fn insert_update_then_read() {
-    //     const TEST_SUITE: usize = 100;
-    //     let mut rng = rand::thread_rng();
-
-    //     // generate a random key/values
-    //     let mut keys = Vec::with_capacity(TEST_SUITE);
-    //     let mut values = Vec::with_capacity(TEST_SUITE);
-    //     let mut updates = Vec::with_capacity(TEST_SUITE);
-    //     for _ in 0..TEST_SUITE {
-    //         let mut key = rand::random::<RingElement<u32>>();
-    //         while keys.contains(&key) {
-    //             key = rand::random::<RingElement<u32>>();
-    //         }
-    //         keys.push(key);
-    //         values.push(ark_bn254::Fr::from(rand::random::<u128>()));
-    //         updates.push(ark_bn254::Fr::from(rand::random::<u128>()));
-    //     }
-
-    //     let [key_share0, key_share1, key_share2] =
-    //         rep3_ring::share_ring_elements_binary(&keys, &mut rng);
-    //     let [value_share0, value_share1, value_share2] =
-    //         rep3::share_field_elements(&values, &mut rng);
-    //     let [update_share0, update_share1, update_share2] =
-    //         rep3::share_field_elements(&updates, &mut rng);
-    //     // need two networks
-    //     let [n0, n1, n2] = LocalNetwork::new_3_parties();
-    //     let [n3, n4, n5] = LocalNetwork::new_3_parties();
-    //     let random_default_value = ark_bn254::Fr::from(rand::random::<u128>());
-
-    //     let [res0, res1, res2] = std::thread::scope(|s| {
-    //         let res0 = s.spawn(|| {
-    //             let mut map = LinearScanObliviousMap::with_default_value(random_default_value);
-    //             let mut state = Rep3State::new(&n0, A2BType::Direct).expect("works");
-    //             let mut reads = Vec::with_capacity(TEST_SUITE);
-    //             let mut path_checks = Vec::with_capacity(TEST_SUITE * 3);
-
-    //             for (k, v, u) in izip!(key_share0, value_share0, update_share0) {
-    //                 // insert
-    //                 let insert_path = map.insert(k, v, &n0, &n3, &mut state)?;
-    //                 path_checks.push(map.verify_path(v, &insert_path, &n0, &mut state)?);
-
-    //                 // update
-    //                 let update_path = map.update(k, u, &n0, &n3, &mut state)?;
-    //                 path_checks.push(map.verify_path(u, &update_path, &n0, &mut state)?);
-
-    //                 // verify
-    //                 let read_value = map.read_path_and_witness(k, &n0, &n3, &mut state)?.path[0];
-    //                 reads.push(read_value);
-    //             }
-    //             eyre::Ok((reads, path_checks))
-    //         });
-
-    //         let res1 = s.spawn(|| {
-    //             let mut map = LinearScanObliviousMap::with_default_value(random_default_value);
-    //             let mut state = Rep3State::new(&n1, A2BType::Direct).expect("works");
-    //             let mut reads = Vec::with_capacity(TEST_SUITE);
-    //             let mut path_checks = Vec::with_capacity(TEST_SUITE * 3);
-
-    //             for (k, v, u) in izip!(key_share1, value_share1, update_share1) {
-    //                 // insert
-    //                 let insert_path = map.insert(k, v, &n1, &n4, &mut state)?;
-    //                 path_checks.push(map.verify_path(v, &insert_path, &n1, &mut state)?);
-
-    //                 // update
-    //                 let update_path = map.update(k, u, &n1, &n4, &mut state)?;
-    //                 path_checks.push(map.verify_path(u, &update_path, &n1, &mut state)?);
-
-    //                 // verify
-    //                 let read_value = map.read_path_and_witness(k, &n1, &n4, &mut state)?.path[0];
-    //                 reads.push(read_value);
-    //             }
-    //             eyre::Ok((reads, path_checks))
-    //         });
-
-    //         let res2 = s.spawn(|| {
-    //             let mut map = LinearScanObliviousMap::with_default_value(random_default_value);
-    //             let mut state = Rep3State::new(&n2, A2BType::Direct).expect("works");
-    //             let mut reads = Vec::with_capacity(TEST_SUITE);
-    //             let mut path_checks = Vec::with_capacity(TEST_SUITE * 3);
-
-    //             for (k, v, u) in izip!(key_share2, value_share2, update_share2) {
-    //                 // insert
-    //                 let insert_path = map.insert(k, v, &n2, &n5, &mut state)?;
-    //                 path_checks.push(map.verify_path(v, &insert_path, &n2, &mut state)?);
-
-    //                 // update
-    //                 let update_path = map.update(k, u, &n2, &n5, &mut state)?;
-    //                 path_checks.push(map.verify_path(u, &update_path, &n2, &mut state)?);
-
-    //                 // verify
-    //                 let read_value = map.read_path_and_witness(k, &n2, &n5, &mut state)?.path[0];
-    //                 reads.push(read_value);
-    //             }
-    //             eyre::Ok((reads, path_checks))
-    //         });
-    //         let res0 = res0.join().expect("can join").expect("did work");
-    //         let res1 = res1.join().expect("can join").expect("did work");
-    //         let res2 = res2.join().expect("can join").expect("did work");
-    //         [res0, res1, res2]
-    //     });
-
-    //     let (reads0, checks0) = res0;
-    //     let (reads1, checks1) = res1;
-    //     let (reads2, checks2) = res2;
-
-    //     for (r0, r1, r2, should) in izip!(reads0, reads1, reads2, updates) {
-    //         assert_eq!((r0 + r1 + r2).a, should);
-    //     }
-
-    //     for (r0, r1, r2) in izip!(checks0, checks1, checks2) {
-    //         assert!((r0 + r1 + r2).a.convert().convert());
-    //     }
-    // }
-
-    // #[test]
-    // pub fn insert_then_read_proof() {
-    //     const TEST_SUITE: usize = 1;
-    //     let mut rng = rand::thread_rng();
-
-    //     // generate a random key/values
-    //     let mut keys = Vec::with_capacity(TEST_SUITE);
-    //     let mut values = Vec::with_capacity(TEST_SUITE);
-    //     for _ in 0..TEST_SUITE {
-    //         let mut key = rand::random::<RingElement<u32>>();
-    //         while keys.contains(&key) {
-    //             key = rand::random::<RingElement<u32>>();
-    //         }
-    //         keys.push(key);
-    //         values.push(ark_bn254::Fr::from(rand::random::<u128>()));
-    //     }
-
-    //     let [key_share0, key_share1, key_share2] =
-    //         rep3_ring::share_ring_elements_binary(&keys, &mut rng);
-    //     let [value_share0, value_share1, value_share2] =
-    //         rep3::share_field_elements(&values, &mut rng);
-    //     // just use the same random value, doesn't really matter
-    //     let [r0, r1, r2] = rep3::share_field_element(ark_bn254::Fr::rand(&mut rng), &mut rng);
-
-    //     // need two networks
-    //     let [n0, n1, n2] = LocalNetwork::new_3_parties();
-    //     let [n3, n4, n5] = LocalNetwork::new_3_parties();
-    //     let random_default_value = ark_bn254::Fr::from(rand::random::<u128>());
-
-    //     let root = std::env!("CARGO_MANIFEST_DIR");
-    //     let read_program = ultrahonk::get_program_artifact(format!(
-    //         "{root}/noir/compiled_circuits/oblivious_map_read.json"
-    //     ))
-    //     .unwrap();
-    //     let (proof_schema, pk, cs) = r1cs::setup_r1cs(read_program, &mut rng).unwrap();
-    //     let proof_schema = Arc::new(proof_schema);
-    //     let pk = Arc::new(pk);
-    //     let cs = Arc::new(cs);
-
-    //     let [res0, res1, res2] = std::thread::scope(|s| {
-    //         let res0 = s.spawn(|| {
-    //             let mut map = LinearScanObliviousMap::with_default_value(random_default_value);
-    //             let mut state = Rep3State::new(&n0, A2BType::Direct).expect("works");
-    //             let mut reads = Vec::with_capacity(TEST_SUITE);
-
-    //             for (k, v) in izip!(key_share0, value_share0) {
-    //                 // read first on key before insert
-    //                 map.insert(k, v, &n0, &n3, &mut state)?;
-    //                 reads.push(map.read_e2e(
-    //                     k,
-    //                     &n0,
-    //                     &n3,
-    //                     r0,
-    //                     &mut state,
-    //                     &proof_schema,
-    //                     &cs,
-    //                     &pk,
-    //                 )?);
-    //             }
-    //             eyre::Ok(reads)
-    //         });
-
-    //         let res1 = s.spawn(|| {
-    //             let mut map = LinearScanObliviousMap::with_default_value(random_default_value);
-    //             let mut state = Rep3State::new(&n1, A2BType::Direct).expect("works");
-    //             let mut reads = Vec::with_capacity(TEST_SUITE);
-
-    //             for (k, v) in izip!(key_share1, value_share1) {
-    //                 // read first on key before insert
-    //                 map.insert(k, v, &n1, &n4, &mut state)?;
-    //                 reads.push(map.read_e2e(
-    //                     k,
-    //                     &n1,
-    //                     &n4,
-    //                     r1,
-    //                     &mut state,
-    //                     &proof_schema,
-    //                     &cs,
-    //                     &pk,
-    //                 )?);
-    //             }
-    //             eyre::Ok(reads)
-    //         });
-
-    //         let res2 = s.spawn(|| {
-    //             let mut map = LinearScanObliviousMap::with_default_value(random_default_value);
-    //             let mut state = Rep3State::new(&n2, A2BType::Direct).expect("works");
-    //             let mut reads = Vec::with_capacity(TEST_SUITE);
-
-    //             for (k, v) in izip!(key_share2, value_share2) {
-    //                 // read first on key before insert
-    //                 map.insert(k, v, &n2, &n5, &mut state)?;
-    //                 reads.push(map.read_e2e(
-    //                     k,
-    //                     &n2,
-    //                     &n5,
-    //                     r2,
-    //                     &mut state,
-    //                     &proof_schema,
-    //                     &cs,
-    //                     &pk,
-    //                 )?);
-    //             }
-    //             eyre::Ok(reads)
-    //         });
-    //         let res0 = res0.join().expect("can join").expect("did work");
-    //         let res1 = res1.join().expect("can join").expect("did work");
-    //         let res2 = res2.join().expect("can join").expect("did work");
-    //         [res0, res1, res2]
-    //     });
-
-    //     for (res0, res1, res2, should) in izip!(res0, res1, res2, values) {
-    //         let (reads0, proof0, public_input0) = res0;
-    //         let (reads1, proof1, public_input1) = res1;
-    //         let (reads2, proof2, public_input2) = res2;
-    //         assert!(
-    //             r1cs::verify(&pk.vk, &proof0, &public_input0).unwrap(),
-    //             "proof verifies"
-    //         );
-    //         assert!(
-    //             r1cs::verify(&pk.vk, &proof1, &public_input1).unwrap(),
-    //             "proof verifies"
-    //         );
-    //         assert!(
-    //             r1cs::verify(&pk.vk, &proof2, &public_input2).unwrap(),
-    //             "proof verifies"
-    //         );
-    //         assert_eq!((reads0 + reads1 + reads2).a, should);
-    //     }
-    // }
 }
