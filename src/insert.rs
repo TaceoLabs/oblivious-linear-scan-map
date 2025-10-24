@@ -13,6 +13,7 @@ use tracing::instrument;
 use crate::{
     INSERT_PROOF_INPUTS, LINEAR_SCAN_TREE_DEPTH, LinearScanObliviousMap, PoseidonHashesWithTrace,
     PoseidonHashesWithTraceInput,
+    cosnark::{self, InsertWithTrace},
 };
 
 /// Request for an insert operation on the oblivious Merkle tree.
@@ -31,21 +32,13 @@ pub struct ObliviousInsertRequest {
 
 /// Response to an oblivious insert operation.
 ///
-// (old_root, new_root, commitment_index, commitment_value)
 /// Returns the new Merkle root, a co-SNARK proof for the insert, and public inputs for verification.
-pub struct ObliviousInsertResult {
+pub struct ObliviousWriteResult {
     pub proof: ark_groth16::Proof<Bn254>,
     pub old_root: ark_bn254::Fr,
     pub new_root: ark_bn254::Fr,
     pub commitment_key: ark_bn254::Fr,
     pub commitment_value: ark_bn254::Fr,
-}
-
-/// Helper struct only used to group the inputs to the proof and traces together.
-/// We just want to make clippy happy.
-pub(crate) struct InsertWithTrace {
-    pub(crate) inputs: Vec<Rep3AcvmType<ark_bn254::Fr>>,
-    pub(crate) traces: Vec<Vec<Rep3AcvmType<ark_bn254::Fr>>>,
 }
 
 /// Input to the `insert_tail` function.
@@ -69,7 +62,7 @@ impl LinearScanObliviousMap {
         net0: &N,
         net1: &N,
         state: &mut Rep3State,
-    ) -> eyre::Result<ObliviousInsertResult> {
+    ) -> eyre::Result<ObliviousWriteResult> {
         tracing::debug!("starting insert! Locking the tree!");
         let insert_with_trace = self.insert(request, net0, net1, state)?;
         let result = self.groth16_insert_proof(net0, net1, insert_with_trace, state);
@@ -95,7 +88,7 @@ impl LinearScanObliviousMap {
         let (path_ohv, (merkle_witness, bitinject)) =
             tracing::debug_span!("insert::read_path_and_witness").in_scope(|| {
                 tracing::debug!("reading path_ohv, witness and decompose in parallel...");
-                Self::join(
+                crate::join(
                     || {
                         let path_ohv = self.find_path_skip_leaf_layer(key);
                         crate::mpc::is_zero_many(path_ohv, net0, state0)
@@ -170,12 +163,12 @@ impl LinearScanObliviousMap {
             randomness_commitment,
             precompute,
         };
-        let (_, poseidon_hashes_with_trace) = Self::join(
+        let (_, poseidon_hashes_with_trace) = crate::join(
             || {
                 self.revoke_old_path(key, path_ohv);
                 eyre::Ok(())
             },
-            || Self::poseidon_hashes_with_write_traces(poseidon_trace_input, net0),
+            || cosnark::poseidon_hashes_with_write_traces(poseidon_trace_input, net0),
         )?;
         let PoseidonHashesWithTrace {
             new_root,
@@ -188,7 +181,7 @@ impl LinearScanObliviousMap {
         // Last networking is to convert the computed values again to binary representation and open the new merkle-root.
         let (layer_values, root) =
             tracing::debug_span!("insert_tail::open_and_a2b").in_scope(|| {
-                Self::join(
+                crate::join(
                     || conversion::a2b_many(&layer_values, net0, state0),
                     || arithmetic::open(new_root, net1),
                 )
@@ -238,12 +231,12 @@ impl LinearScanObliviousMap {
         net1: &N,
         insert_with_trace: InsertWithTrace,
         state0: &mut Rep3State,
-    ) -> eyre::Result<ObliviousInsertResult> {
+    ) -> eyre::Result<ObliviousWriteResult> {
         let InsertWithTrace { inputs, traces } = insert_with_trace;
         let (proof, public_inputs) =
-            Self::co_snark(inputs, traces, &self.write_groth16, net0, net1, state0)?;
+            cosnark::noir_groth16(inputs, traces, &self.write_groth16, net0, net1, state0)?;
         debug_assert_eq!(public_inputs[1], self.root);
-        Ok(ObliviousInsertResult {
+        Ok(ObliviousWriteResult {
             proof,
             old_root: public_inputs[0],
             new_root: public_inputs[1],
@@ -279,11 +272,11 @@ mod tests {
     use mpc_net::local::LocalNetwork;
 
     use crate::{
-        LinearScanObliviousMap, ObliviousInsertRequest, ObliviousInsertResult,
-        ObliviousReadRequest, tests::groth16_material,
+        LinearScanObliviousMap, ObliviousInsertRequest, ObliviousReadRequest, ObliviousWriteResult,
+        tests::groth16_material,
     };
 
-    impl ObliviousInsertResult {
+    impl ObliviousWriteResult {
         pub(crate) fn inputs_to_vec(&self) -> Vec<ark_bn254::Fr> {
             vec![
                 self.old_root,

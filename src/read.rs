@@ -1,25 +1,18 @@
-use ark_ff::Zero as _;
-use co_noir::{Bn254, Rep3AcvmType};
-use co_noir_to_r1cs::trace::MpcTraceHasher;
-use itertools::{Itertools as _, izip};
+use co_noir::Bn254;
 
 use mpc_core::{
     MpcState as _,
-    gadgets::poseidon2::Poseidon2,
     protocols::{
-        rep3::{self, Rep3PrimeFieldShare, Rep3State, network::Rep3NetworkExt},
+        rep3::{Rep3PrimeFieldShare, Rep3State, network::Rep3NetworkExt},
         rep3_ring::Rep3RingShare,
     },
 };
 use tracing::instrument;
 
-use crate::{LINEAR_SCAN_TREE_DEPTH, LinearScanObliviousMap, PathAndWitness, READ_PROOF_INPUTS};
-
-struct ReadWithTrace {
-    read_value: Rep3PrimeFieldShare<ark_bn254::Fr>,
-    inputs: Vec<Rep3AcvmType<ark_bn254::Fr>>,
-    traces: Vec<Vec<Rep3AcvmType<ark_bn254::Fr>>>,
-}
+use crate::{
+    LinearScanObliviousMap,
+    cosnark::{self, ReadWithTrace},
+};
 
 /// Request for a read operation on the oblivious Merkle tree.
 ///
@@ -88,7 +81,7 @@ impl LinearScanObliviousMap {
 
         // build the poseidon execution traces for the proof.
         tracing::debug!("building read execution trace");
-        let trace = self.build_read_execution_trace(
+        let trace = cosnark::build_read_execution_trace(
             path_and_witness,
             bitinject,
             randomness_commitment,
@@ -117,7 +110,7 @@ impl LinearScanObliviousMap {
         } = read_with_trace;
 
         let (proof, public_inputs) =
-            Self::co_snark(inputs, traces, &self.read_groth16, net0, net1, state0)?;
+            cosnark::noir_groth16(inputs, traces, &self.read_groth16, net0, net1, state0)?;
         tracing::trace!("> groth16 read proof");
 
         debug_assert_eq!(public_inputs[0], self.root);
@@ -126,92 +119,6 @@ impl LinearScanObliviousMap {
             proof,
             root: public_inputs[0],
             commitment: public_inputs[1],
-        })
-    }
-
-    /// Builds the execution traces for the read co-SNARK. We provide the path and the witness elements both, so we can do all
-    /// Poseidons at the same time. This reduces the multiplicative depth only one Poseidon2.
-    ///
-    /// Additionally, we also produce the commitment to the key at the same time.
-    ///
-    /// This method returns
-    /// - the read value
-    /// - the inputs for the coSNARK
-    /// - the execution traces for all hashes to not compute them in co-ACVM.
-    #[instrument(level = "debug", skip_all)]
-    #[expect(clippy::too_many_arguments)]
-    fn build_read_execution_trace<N: Rep3NetworkExt>(
-        &self,
-        path_and_witness: PathAndWitness,
-        positions: Vec<Rep3PrimeFieldShare<ark_bn254::Fr>>,
-        randomness_commitment: Rep3PrimeFieldShare<ark_bn254::Fr>,
-        net0: &N,
-        net1: &N,
-        state0: &mut Rep3State,
-        state1: &mut Rep3State,
-    ) -> eyre::Result<ReadWithTrace> {
-        let PathAndWitness { path, witness } = path_and_witness;
-
-        let mut proof_inputs = Vec::with_capacity(READ_PROOF_INPUTS);
-        let read_value = path[0];
-        // start building the proof inputs
-        proof_inputs.push(read_value.into());
-        for p in positions.clone().into_iter() {
-            proof_inputs.push(p.into());
-        }
-
-        let hasher = Poseidon2::<ark_bn254::Fr, 2, 5>::default();
-        let network1_span = tracing::debug_span!("build_read_trace::network1");
-        let (mut pre_computations, switches) = network1_span.in_scope(|| {
-            Self::join(
-                || hasher.precompute_rep3(LINEAR_SCAN_TREE_DEPTH + 1, net0, state0),
-                || {
-                    // we compute all switches at the same time
-                    // needed to determine if values are the left/right input to
-                    // Poseidon2
-                    tracing::trace!("computing switches...");
-                    let switches = izip!(path.iter(), witness.iter())
-                        .map(|(p, w)| w - p)
-                        .collect_vec();
-                    rep3::arithmetic::mul_vec(&positions, &switches, net1, state1)
-                },
-            )
-        })?;
-
-        tracing::trace!("doing oblivious switches...");
-        let mut ins = Vec::with_capacity(LINEAR_SCAN_TREE_DEPTH * 2);
-        for (p, w, mul) in izip!(path, witness, switches) {
-            proof_inputs.push(w.into());
-            let hash_left = mul + p;
-            let hash_right = w - mul;
-            ins.push(hash_left);
-            ins.push(hash_right);
-        }
-        // Calculate the commitment to the index
-        let mut index = Rep3PrimeFieldShare::zero();
-        for p in positions.iter().rev() {
-            index += index;
-            index += p;
-        }
-        // the input for the commitment
-        ins.push(index);
-        ins.push(randomness_commitment);
-        proof_inputs.push(randomness_commitment.into());
-
-        // Compute the traces
-        let noir_trace_span = tracing::debug_span!("build_read_trace::noir_traces");
-        let (_, traces) = noir_trace_span.in_scope(|| {
-            tracing::debug!("generating poseidon traces...");
-            hasher.hash_rep3_generate_noir_trace_many::<_, 33, 66>(
-                ins.try_into().expect("works"),
-                &mut pre_computations,
-                net0,
-            )
-        })?;
-        Ok(ReadWithTrace {
-            read_value,
-            inputs: proof_inputs,
-            traces: traces.to_vec(),
         })
     }
 }
