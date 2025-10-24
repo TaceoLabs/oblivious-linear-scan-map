@@ -1,4 +1,5 @@
 use co_noir::Rep3AcvmType;
+use itertools::Itertools;
 use mpc_core::{
     MpcState as _,
     gadgets::poseidon2::Poseidon2,
@@ -7,12 +8,14 @@ use mpc_core::{
         rep3_ring::{Rep3RingShare, ring::bit::Bit},
     },
 };
+use rayon::prelude::*;
 use tracing::instrument;
 
 use crate::{
     INSERT_PROOF_INPUTS, LINEAR_SCAN_TREE_DEPTH, LinearScanObliviousMap, PoseidonHashesWithTrace,
     PoseidonHashesWithTraceInput,
-    insert::{InsertWithTrace, ObliviousInsertResult},
+    cosnark::{self, InsertWithTrace},
+    insert::ObliviousWriteResult,
 };
 
 pub struct ObliviousUpdateRequest {
@@ -39,7 +42,7 @@ impl LinearScanObliviousMap {
         net0: &N,
         net1: &N,
         state: &mut Rep3State,
-    ) -> eyre::Result<ObliviousInsertResult> {
+    ) -> eyre::Result<ObliviousWriteResult> {
         tracing::debug!("starting update! Locking the tree!");
         let update_with_trace = self.update(update_request, net0, net1, state)?;
         let result = self.groth16_insert_proof(net0, net1, update_with_trace, state);
@@ -66,7 +69,7 @@ impl LinearScanObliviousMap {
             randomness_commitment,
         } = update_tail;
 
-        let (old_value, precompute) = Self::join(
+        let (old_value, precompute) = crate::join(
             || self.read_from_leaf_layer(&path_ohv, net0, state0),
             || {
                 let poseidon2 = Poseidon2::<ark_bn254::Fr, 2, 5>::default();
@@ -91,7 +94,7 @@ impl LinearScanObliviousMap {
             precompute,
         };
         let poseidon_hashes_with_trace =
-            Self::poseidon_hashes_with_write_traces(poseidon_trace_input, net0)?;
+            cosnark::poseidon_hashes_with_write_traces(poseidon_trace_input, net0)?;
 
         let PoseidonHashesWithTrace {
             new_root,
@@ -105,45 +108,58 @@ impl LinearScanObliviousMap {
         let layer_values = conversion::a2b_many(&layer_values, net0, state0)?;
         let _span_guard = tracing::debug_span!("update database").entered();
 
-        // Update the full database, essentially a big cmux
-        let mut to_reshare = Vec::with_capacity(self.total_count);
-        let mut start = 0;
-        for (layer, new_value) in self.layers.iter().zip(layer_values) {
-            let end = start + layer.values.len();
-            let new_value = new_value.try_into().expect("Works");
+        // multithread the update per layer
+        let ranges = self
+            .layers
+            .iter()
+            .scan(0, |offset, layer| {
+                let start = *offset;
+                let end = start + layer.values.len();
+                *offset = end;
+                Some((start, end))
+            })
+            .collect_vec();
 
-            for (value, ohv) in layer.values.iter().zip(path_ohv[start..end].iter()) {
-                // Add the cmux: If ohv == 0, we keep the old value, else we update it
-                let other = &new_value ^ value;
-                let mut cmux = value.a.to_owned();
-                // This is the AND-gate protocol ohv_ & other
-                if ohv.a.0.convert() {
-                    cmux ^= other.a ^ other.b;
+        // Update the full database, essentially a big cmux
+        let mut to_reshare = (self.layers.par_iter(), layer_values, ranges.par_iter())
+            .into_par_iter()
+            .flat_map(|(layer, new_value, (start, end))| {
+                let new_value = new_value.try_into().expect("Works");
+                let mut to_reshare = Vec::with_capacity(layer.values.len());
+
+                for (value, ohv) in layer.values.iter().zip(path_ohv[*start..*end].iter()) {
+                    // Add the cmux: If ohv == 0, we keep the old value, else we update it
+                    let other = &new_value ^ value;
+                    let mut cmux = value.a.to_owned();
+                    // This is the AND-gate protocol ohv_ & other
+                    if ohv.a.0.convert() {
+                        cmux ^= other.a ^ other.b;
+                    }
+                    if ohv.b.0.convert() {
+                        cmux ^= other.a;
+                    }
+                    to_reshare.push(cmux);
                 }
-                if ohv.b.0.convert() {
-                    cmux ^= other.a;
-                }
-                to_reshare.push(cmux);
-            }
-            start = end;
-        }
+                to_reshare
+            })
+            .collect::<Vec<_>>();
+
         // Reshare also the root
         to_reshare.push(new_root.b.into());
         // Put the new values in
         let mut reshared = net0.reshare_many(&to_reshare)?;
-        let mut start = 0;
-        for layer in self.layers.iter_mut() {
-            let end = start + layer.values.len();
-            for (value, (a, b)) in layer.values.iter_mut().zip(
-                to_reshare[start..end]
-                    .iter()
-                    .zip(reshared[start..end].iter()),
-            ) {
-                value.a = *a;
-                value.b = *b;
-            }
-            start = end;
-        }
+        (self.layers.par_iter_mut(), ranges)
+            .into_par_iter()
+            .for_each(|(layer, (start, end))| {
+                for (value, (a, b)) in layer.values.iter_mut().zip(
+                    to_reshare[start..end]
+                        .iter()
+                        .zip(reshared[start..end].iter()),
+                ) {
+                    value.a = *a;
+                    value.b = *b;
+                }
+            });
 
         // Update the root
         self.root =
@@ -173,7 +189,7 @@ impl LinearScanObliviousMap {
         let mut state1 = state0.fork(1).expect("cant fail for rep3");
         let (path_ohv, (merkle_witness, bitinject)) =
             tracing::debug_span!("update::read_path_and_witness").in_scope(|| {
-                Self::join(
+                crate::join(
                     || {
                         let path_ohv = self.find_path(key);
                         crate::mpc::is_zero_many(path_ohv, net0, state0)
@@ -207,7 +223,7 @@ impl LinearScanObliviousMap {
         randomness_index: Rep3PrimeFieldShare<ark_bn254::Fr>,
         randomness_commitment: Rep3PrimeFieldShare<ark_bn254::Fr>,
         state: &mut Rep3State,
-    ) -> eyre::Result<ObliviousInsertResult> {
+    ) -> eyre::Result<ObliviousWriteResult> {
         // The value in update is only ever used in cmux calls with a secret share, so we can not get any performance advantage by knowing this value in plain. Thus we just use the update protocol.
         //
         // For now we use the default value as deleted marker with focus on the bit-service. There may be use-cases where this is not desired though - in that case we need to change this.
