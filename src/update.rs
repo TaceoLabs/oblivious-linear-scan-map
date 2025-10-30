@@ -13,7 +13,7 @@ use tracing::instrument;
 
 use crate::{
     INSERT_PROOF_INPUTS, LINEAR_SCAN_TREE_DEPTH, LinearScanObliviousMap, PoseidonHashesWithTrace,
-    PoseidonHashesWithTraceInput,
+    PoseidonHashesWithTraceInput, Rep3BigIntShare,
     cosnark::{self, InsertWithTrace},
     insert::ObliviousWriteResult,
 };
@@ -124,12 +124,13 @@ impl LinearScanObliviousMap {
         let mut to_reshare = (self.layers.par_iter(), layer_values, ranges.par_iter())
             .into_par_iter()
             .flat_map(|(layer, new_value, (start, end))| {
-                let new_value = new_value.try_into().expect("Works");
+                let new_value =
+                    Rep3BigIntShare::<ark_bn254::Fr>::try_from(new_value).expect("Works");
                 let mut to_reshare = Vec::with_capacity(layer.values.len());
 
                 for (value, ohv) in layer.values.iter().zip(path_ohv[*start..*end].iter()) {
                     // Add the cmux: If ohv == 0, we keep the old value, else we update it
-                    let other = &new_value ^ value;
+                    let other = new_value ^ value;
                     let mut cmux = value.a.to_owned();
                     // This is the AND-gate protocol ohv_ & other
                     if ohv.a.0.convert() {
@@ -185,7 +186,6 @@ impl LinearScanObliviousMap {
             randomness_index,
             randomness_commitment,
         } = update_request;
-
         let mut state1 = state0.fork(1).expect("cant fail for rep3");
         let (path_ohv, (merkle_witness, bitinject)) =
             tracing::debug_span!("update::read_path_and_witness").in_scope(|| {

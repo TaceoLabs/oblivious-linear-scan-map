@@ -78,6 +78,7 @@ impl ObliviousLayer {
     }
 }
 
+#[derive(Clone)]
 pub struct LinearScanObliviousMap {
     layers: [ObliviousLayer; LINEAR_SCAN_TREE_DEPTH],
     leaf_count: usize,
@@ -221,6 +222,7 @@ impl LinearScanObliviousMap {
         net: &N,
         state: &mut Rep3State,
     ) -> eyre::Result<Vec<Rep3PrimeFieldShare<ark_bn254::Fr>>> {
+        // we only need the 32 key-bits
         let key_bits = (0..32).map(|shift| (key >> shift).get_bit(0)).collect_vec();
         // also do the bitinject
         crate::mpc::bit_inject_from_bits_to_field_many(&key_bits, net, state)

@@ -16,7 +16,7 @@ use mpc_net::Network;
 use rand::{CryptoRng, Rng};
 
 // TODO check out https://github.com/recmo/uint for share over F::BigInt
-#[derive(Default, Debug, Clone, CanonicalSerialize, CanonicalDeserialize)]
+#[derive(Default, Debug, Clone, Copy, CanonicalSerialize, CanonicalDeserialize)]
 pub struct Rep3BigIntShare<F: PrimeField> {
     /// Share of this party
     pub a: F::BigInt,
@@ -129,8 +129,7 @@ pub(crate) fn is_zero_many<N: Network>(
     net: &N,
     state: &mut Rep3State,
 ) -> eyre::Result<Vec<Rep3RingShare<Bit>>> {
-    let one = RingElement::one();
-    let mask_neg = (one << 32) - one;
+    let mask_neg = RingElement::zero() - RingElement::one();
     x.iter_mut().for_each(|x| *x ^= mask_neg);
 
     let x = fold_stage!(x, state, net, u16, 16);
