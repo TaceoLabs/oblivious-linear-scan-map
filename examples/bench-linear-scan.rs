@@ -198,7 +198,7 @@ fn benchmarks<R: Rng + CryptoRng>(config: &Config, rng: &mut R) -> eyre::Result<
 
     tracing::info!("Sharing Map");
     let [map0, map1, map2] = map.share(rng)?;
-    let mut map = match config.network.my_id {
+    let map = match config.network.my_id {
         0 => map0,
         1 => map1,
         2 => map2,
@@ -207,8 +207,9 @@ fn benchmarks<R: Rng + CryptoRng>(config: &Config, rng: &mut R) -> eyre::Result<
 
     tracing::info!("Starting benchmarks");
     read(&map, used_key, r_idx, config)?;
-    insert(&mut map, unused_key, r_idx, r_value, config, rng)?;
-    update(&mut map, used_key, r_idx, r_value, config, rng)?;
+    insert(&map, unused_key, r_idx, r_value, config, rng)?;
+    update(&map, used_key, r_idx, r_value, config, rng)?;
+    prune(&map, config)?;
 
     Ok(ExitCode::SUCCESS)
 }
@@ -221,8 +222,9 @@ fn read(
 ) -> eyre::Result<ExitCode> {
     bench_op(
         config,
+        map,
         format!("Read (d=E2E, n={})", config.num_items),
-        |state, net0, net1| {
+        |map, state, net0, net1| {
             let req = ObliviousReadRequest {
                 key,
                 randomness_commitment,
@@ -234,7 +236,7 @@ fn read(
 }
 
 pub fn insert<R: Rng + CryptoRng>(
-    map: &mut LinearScanObliviousMap,
+    map: &LinearScanObliviousMap,
     key: Rep3RingShare<u32>,
     randomness_index: Rep3PrimeFieldShare<ark_bn254::Fr>,
     randomness_commitment: Rep3PrimeFieldShare<ark_bn254::Fr>,
@@ -248,8 +250,9 @@ pub fn insert<R: Rng + CryptoRng>(
     // Capture everything needed inside the closure.
     bench_op(
         config,
+        map,
         format!("Insert Threads (n={})", config.num_items),
-        |state, net0, net1| {
+        |mut map, state, net0, net1| {
             let req = ObliviousInsertRequest {
                 key,
                 insert_value,
@@ -263,7 +266,7 @@ pub fn insert<R: Rng + CryptoRng>(
 }
 
 pub fn update<R: Rng + CryptoRng>(
-    map: &mut LinearScanObliviousMap,
+    map: &LinearScanObliviousMap,
     key: Rep3RingShare<u32>,
     randomness_index: Rep3PrimeFieldShare<ark_bn254::Fr>,
     randomness_commitment: Rep3PrimeFieldShare<ark_bn254::Fr>,
@@ -277,8 +280,9 @@ pub fn update<R: Rng + CryptoRng>(
     // Capture everything needed inside the closure.
     bench_op(
         config,
+        map,
         format!("Update (n={})", config.num_items),
-        |state, net0, net1| {
+        |mut map, state, net0, net1| {
             let update_request = ObliviousUpdateRequest {
                 key,
                 update_value,
@@ -290,9 +294,27 @@ pub fn update<R: Rng + CryptoRng>(
         },
     )
 }
-pub fn bench_op<F>(config: &Config, label: impl Into<String>, mut op: F) -> eyre::Result<ExitCode>
+
+fn prune(map: &LinearScanObliviousMap, config: &Config) -> eyre::Result<ExitCode> {
+    bench_op(
+        config,
+        map,
+        format!("Prune (d=E2E, n={})", config.num_items),
+        |mut map, _, net0, _| {
+            map.prune(net0)?;
+            Ok(())
+        },
+    )
+}
+
+pub fn bench_op<F>(
+    config: &Config,
+    map: &LinearScanObliviousMap,
+    label: impl Into<String>,
+    mut op: F,
+) -> eyre::Result<ExitCode>
 where
-    F: FnMut(&mut Rep3State, &TcpNetwork, &TcpNetwork) -> eyre::Result<()>,
+    F: FnMut(LinearScanObliviousMap, &mut Rep3State, &TcpNetwork, &TcpNetwork) -> eyre::Result<()>,
 {
     let label = label.into();
     let mut times = Vec::with_capacity(config.runs);
@@ -308,8 +330,9 @@ where
         let stats_before0 = net0.get_connection_stats();
         let stats_before1 = net1.get_connection_stats();
 
+        let cloned = map.to_owned();
         let start = Instant::now();
-        op(&mut state, &net0, &net1)?;
+        op(cloned, &mut state, &net0, &net1)?;
         let duration = start.elapsed().as_micros() as f64;
         times.push(duration);
 

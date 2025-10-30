@@ -12,7 +12,7 @@ pub(crate) fn compute_merkle_root<let N: u32>(
         let path_bit_is_bit = path_bit * (path_bit - 1);
         assert(path_bit_is_bit == 0);
 
-        // CMUX the hash pathpath
+        // CMUX the hash path
         let mul = path_bit * (path_hash - current);
         let hash_left = mul + current;
         let hash_right = path_hash - mul;

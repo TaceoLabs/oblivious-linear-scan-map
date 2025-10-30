@@ -69,7 +69,6 @@ impl LinearScanObliviousMap {
             key,
             randomness_commitment,
         } = req;
-
         let mut state1 = state0.fork(1).expect("cannot fail for rep3");
         // Read the path and the witness from the tree.
         // We do this so we can do all the Poseidon2 runs at the same time, reducing the multiplicative-depth of the protocol. This of course increases the amount of bytes we need to send over the network by two.
