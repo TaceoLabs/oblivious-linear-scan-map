@@ -12,10 +12,9 @@ use rayon::prelude::*;
 use tracing::instrument;
 
 use crate::{
-    INSERT_PROOF_INPUTS, LINEAR_SCAN_TREE_DEPTH, LinearScanObliviousMap, PoseidonHashesWithTrace,
-    PoseidonHashesWithTraceInput, Rep3BigIntShare,
+    INSERT_PROOF_INPUTS, LINEAR_SCAN_TREE_DEPTH, Rep3BigIntShare,
+    base::{MapBase, PoseidonHashesWithTrace, PoseidonHashesWithTraceInput},
     cosnark::{self, InsertWithTrace},
-    insert::ObliviousWriteResult,
 };
 
 pub struct ObliviousUpdateRequest {
@@ -34,20 +33,48 @@ pub(super) struct UpdateTail {
     pub(super) randomness_commitment: Rep3PrimeFieldShare<ark_bn254::Fr>,
 }
 
-impl LinearScanObliviousMap {
+impl MapBase {
     #[instrument(level = "debug", skip_all)]
-    pub fn oblivious_update<N: Rep3NetworkExt>(
+    pub(super) fn update<N: Rep3NetworkExt>(
         &mut self,
         update_request: ObliviousUpdateRequest,
         net0: &N,
         net1: &N,
-        state: &mut Rep3State,
-    ) -> eyre::Result<ObliviousWriteResult> {
-        tracing::debug!("starting update! Locking the tree!");
-        let update_with_trace = self.update(update_request, net0, net1, state)?;
-        let result = self.groth16_insert_proof(net0, net1, update_with_trace, state);
-        tracing::debug!("update successful!");
-        result
+        state0: &mut Rep3State,
+    ) -> eyre::Result<InsertWithTrace> {
+        let ObliviousUpdateRequest {
+            key,
+            update_value,
+            randomness_index,
+            randomness_commitment,
+        } = update_request;
+        let mut state1 = state0.fork(1).expect("cant fail for rep3");
+        let (path_ohv, (merkle_witness, bitinject)) =
+            tracing::debug_span!("update::read_path_and_witness").in_scope(|| {
+                crate::join(
+                    || {
+                        let path_ohv = self.find_path(key);
+                        crate::mpc::is_zero_many(path_ohv, net0, state0)
+                    },
+                    || {
+                        let witness = self.read_merkle_witness(key, net1, &mut state1)?;
+                        let bitinject = Self::key_decompose(key, net1, &mut state1)?;
+                        Ok((witness, bitinject))
+                    },
+                )
+            })?;
+        let update_tail = UpdateTail {
+            update_value,
+            path_ohv,
+            merkle_witness,
+            bitinject,
+            randomness_index,
+            randomness_commitment,
+        };
+        // we have this update tail because we also support the update_or_insert operation. For that we do the big AND-tree for the ohv to determine whether we need to do an update or insert.
+        //
+        // Therefore we split the logic into AND-tree and tail.
+        self.update_tail(update_tail, net0, net1, state0, &mut state1)
     }
 
     #[instrument(level = "debug", skip_all)]
@@ -171,72 +198,8 @@ impl LinearScanObliviousMap {
             traces,
         })
     }
-
-    #[instrument(level = "debug", skip_all)]
-    fn update<N: Rep3NetworkExt>(
-        &mut self,
-        update_request: ObliviousUpdateRequest,
-        net0: &N,
-        net1: &N,
-        state0: &mut Rep3State,
-    ) -> eyre::Result<InsertWithTrace> {
-        let ObliviousUpdateRequest {
-            key,
-            update_value,
-            randomness_index,
-            randomness_commitment,
-        } = update_request;
-        let mut state1 = state0.fork(1).expect("cant fail for rep3");
-        let (path_ohv, (merkle_witness, bitinject)) =
-            tracing::debug_span!("update::read_path_and_witness").in_scope(|| {
-                crate::join(
-                    || {
-                        let path_ohv = self.find_path(key);
-                        crate::mpc::is_zero_many(path_ohv, net0, state0)
-                    },
-                    || {
-                        let witness = self.read_merkle_witness(key, net1, &mut state1)?;
-                        let bitinject = Self::key_decompose(key, net1, &mut state1)?;
-                        Ok((witness, bitinject))
-                    },
-                )
-            })?;
-        let update_tail = UpdateTail {
-            update_value,
-            path_ohv,
-            merkle_witness,
-            bitinject,
-            randomness_index,
-            randomness_commitment,
-        };
-        // we have this update tail because we also support the update_or_insert operation. For that we do the big AND-tree for the ohv to determine whether we need to do an update or insert.
-        //
-        // Therefore we split the logic into AND-tree and tail.
-        self.update_tail(update_tail, net0, net1, state0, &mut state1)
-    }
-
-    pub fn delete<N: Rep3NetworkExt>(
-        &mut self,
-        key: Rep3RingShare<u32>,
-        net0: &N,
-        net1: &N,
-        randomness_index: Rep3PrimeFieldShare<ark_bn254::Fr>,
-        randomness_commitment: Rep3PrimeFieldShare<ark_bn254::Fr>,
-        state: &mut Rep3State,
-    ) -> eyre::Result<ObliviousWriteResult> {
-        // The value in update is only ever used in cmux calls with a secret share, so we can not get any performance advantage by knowing this value in plain. Thus we just use the update protocol.
-        //
-        // For now we use the default value as deleted marker with focus on the bit-service. There may be use-cases where this is not desired though - in that case we need to change this.
-        let default_trivial_share = self.promote_default_value(net0);
-        let update_request = ObliviousUpdateRequest {
-            key,
-            update_value: default_trivial_share,
-            randomness_index,
-            randomness_commitment,
-        };
-        self.oblivious_update(update_request, net0, net1, state)
-    }
 }
+
 #[cfg(test)]
 mod tests {
     use co_noir_to_r1cs::noir::r1cs;

@@ -2,7 +2,7 @@ use eyre::Context;
 use itertools::izip;
 use mpc_core::protocols::rep3::network::Rep3NetworkExt;
 
-use crate::{LINEAR_SCAN_TREE_DEPTH, LinearScanObliviousMap, ObliviousLayer};
+use crate::{LINEAR_SCAN_TREE_DEPTH, ObliviousLayer, base::MapBase};
 
 struct OpenedBitStream {
     a: Vec<u64>,
@@ -40,8 +40,8 @@ impl OpenedBitStream {
     }
 }
 
-impl LinearScanObliviousMap {
-    pub fn prune<N: Rep3NetworkExt>(&mut self, net: &N) -> eyre::Result<()> {
+impl MapBase {
+    pub(super) fn prune<N: Rep3NetworkExt>(&mut self, net: &N) -> eyre::Result<()> {
         // 1) Open all bits that mark a value as used or not and batch them in u64
         let shift = LINEAR_SCAN_TREE_DEPTH - 1;
         // u128 doesn't implement canonical deserialize
@@ -136,9 +136,9 @@ mod tests {
                     write_groth16,
                 );
                 map.prune(&n0)?;
-                assert_eq!(map.total_count, 0);
-                assert_eq!(map.leaf_count, 0);
-                for l in map.layers {
+                assert_eq!(map.total_count(), 0);
+                assert_eq!(map.leaf_count(), 0);
+                for l in map.inner.layers {
                     assert!(l.keys.is_empty());
                     assert!(l.values.is_empty());
                 }
@@ -153,9 +153,9 @@ mod tests {
                     write_groth16,
                 );
                 map.prune(&n1)?;
-                assert_eq!(map.total_count, 0);
-                assert_eq!(map.leaf_count, 0);
-                for l in map.layers {
+                assert_eq!(map.total_count(), 0);
+                assert_eq!(map.leaf_count(), 0);
+                for l in map.inner.layers {
                     assert!(l.keys.is_empty());
                     assert!(l.values.is_empty());
                 }
@@ -170,9 +170,9 @@ mod tests {
                     write_groth16,
                 );
                 map.prune(&n2)?;
-                assert_eq!(map.total_count, 0);
-                assert_eq!(map.leaf_count, 0);
-                for l in map.layers {
+                assert_eq!(map.total_count(), 0);
+                assert_eq!(map.leaf_count(), 0);
+                for l in map.inner.layers {
                     assert!(l.keys.is_empty());
                     assert!(l.values.is_empty());
                 }
@@ -242,13 +242,13 @@ mod tests {
                 map.prune(&n0)?;
 
                 // check the values and layers - then read
-                // assert_eq!(map.total_count, 12);
-                assert_eq!(map.leaf_count, 5);
-                assert_eq!(map.layers[31].keys.len(), 2);
-                assert_eq!(map.layers[31].values.len(), 2);
-                assert_eq!(map.layers[30].keys.len(), 4);
-                assert_eq!(map.layers[30].values.len(), 4);
-                for layer in map.layers.iter().rev().skip(2) {
+                // assert_eq!(map.total_count(), 12);
+                assert_eq!(map.leaf_count(), 5);
+                assert_eq!(map.inner.layers[31].keys.len(), 2);
+                assert_eq!(map.inner.layers[31].values.len(), 2);
+                assert_eq!(map.inner.layers[30].keys.len(), 4);
+                assert_eq!(map.inner.layers[30].values.len(), 4);
+                for layer in map.inner.layers.iter().rev().skip(2) {
                     assert_eq!(layer.keys.len(), 5);
                     assert_eq!(layer.values.len(), 5);
                 }
@@ -289,13 +289,13 @@ mod tests {
                 map.prune(&n1)?;
 
                 // check the values and layers - then read
-                // assert_eq!(map.total_count, 12);
-                assert_eq!(map.leaf_count, 5);
-                assert_eq!(map.layers[31].keys.len(), 2);
-                assert_eq!(map.layers[31].values.len(), 2);
-                assert_eq!(map.layers[30].keys.len(), 4);
-                assert_eq!(map.layers[30].values.len(), 4);
-                for layer in map.layers.iter().rev().skip(2) {
+                // assert_eq!(map.total_count(), 12);
+                assert_eq!(map.leaf_count(), 5);
+                assert_eq!(map.inner.layers[31].keys.len(), 2);
+                assert_eq!(map.inner.layers[31].values.len(), 2);
+                assert_eq!(map.inner.layers[30].keys.len(), 4);
+                assert_eq!(map.inner.layers[30].values.len(), 4);
+                for layer in map.inner.layers.iter().rev().skip(2) {
                     assert_eq!(layer.keys.len(), 5);
                     assert_eq!(layer.values.len(), 5);
                 }
@@ -337,13 +337,13 @@ mod tests {
                 map.prune(&n2)?;
 
                 // check the values and layers - then read
-                // assert_eq!(map.total_count, 12);
-                assert_eq!(map.leaf_count, 5);
-                assert_eq!(map.layers[31].keys.len(), 2);
-                assert_eq!(map.layers[31].values.len(), 2);
-                assert_eq!(map.layers[30].keys.len(), 4);
-                assert_eq!(map.layers[30].values.len(), 4);
-                for layer in map.layers.iter().rev().skip(2) {
+                // assert_eq!(map.total_count(), 12);
+                assert_eq!(map.leaf_count(), 5);
+                assert_eq!(map.inner.layers[31].keys.len(), 2);
+                assert_eq!(map.inner.layers[31].values.len(), 2);
+                assert_eq!(map.inner.layers[30].keys.len(), 4);
+                assert_eq!(map.inner.layers[30].values.len(), 4);
+                for layer in map.inner.layers.iter().rev().skip(2) {
                     assert_eq!(layer.keys.len(), 5);
                     assert_eq!(layer.values.len(), 5);
                 }

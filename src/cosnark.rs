@@ -14,8 +14,8 @@ use co_noir_to_r1cs::r1cs::noir_proof_schema::NoirProofScheme;
 use tracing::instrument;
 
 use crate::{
-    LINEAR_SCAN_TREE_DEPTH, PathAndWitness, PoseidonHashesWithTrace, PoseidonHashesWithTraceInput,
-    READ_PROOF_INPUTS,
+    LINEAR_SCAN_TREE_DEPTH, READ_PROOF_INPUTS,
+    base::{PathAndWitness, PoseidonHashesWithTrace, PoseidonHashesWithTraceInput},
 };
 
 #[derive(Clone)]
