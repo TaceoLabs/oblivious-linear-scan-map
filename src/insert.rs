@@ -11,8 +11,8 @@ use mpc_core::{
 use tracing::instrument;
 
 use crate::{
-    INSERT_PROOF_INPUTS, LINEAR_SCAN_TREE_DEPTH, LinearScanObliviousMap, PoseidonHashesWithTrace,
-    PoseidonHashesWithTraceInput,
+    INSERT_PROOF_INPUTS, LINEAR_SCAN_TREE_DEPTH, LinearScanObliviousMap,
+    base::{MapBase, PoseidonHashesWithTrace, PoseidonHashesWithTraceInput},
     cosnark::{self, InsertWithTrace},
 };
 
@@ -54,24 +54,9 @@ pub(super) struct InsertTail {
     pub(super) randomness_commitment: Rep3PrimeFieldShare<ark_bn254::Fr>,
 }
 
-impl LinearScanObliviousMap {
+impl MapBase {
     #[instrument(level = "debug", skip_all)]
-    pub fn oblivious_insert<N: Rep3NetworkExt>(
-        &mut self,
-        request: ObliviousInsertRequest,
-        net0: &N,
-        net1: &N,
-        state: &mut Rep3State,
-    ) -> eyre::Result<ObliviousWriteResult> {
-        tracing::debug!("starting insert! Locking the tree!");
-        let insert_with_trace = self.insert(request, net0, net1, state)?;
-        let result = self.groth16_insert_proof(net0, net1, insert_with_trace, state);
-        tracing::debug!("insert successful!");
-        result
-    }
-
-    #[instrument(level = "debug", skip_all)]
-    fn insert<N: Rep3NetworkExt>(
+    pub(super) fn insert<N: Rep3NetworkExt>(
         &mut self,
         request: ObliviousInsertRequest,
         net0: &N,
@@ -115,6 +100,28 @@ impl LinearScanObliviousMap {
         //
         // Therefore we split the logic into AND-tree and tail.
         self.insert_tail(insert_tail, net0, net1, state0)
+    }
+
+    #[instrument(level = "debug", skip_all)]
+    fn revoke_old_path(&mut self, mut key: Rep3RingShare<u32>, path_ohv: Vec<Rep3RingShare<Bit>>) {
+        tracing::trace!("> revoke old path");
+        let shift = LINEAR_SCAN_TREE_DEPTH - 1;
+        self.layers[0].keys.push(key);
+        let mut start = 0;
+        for i in (0..self.layers.len()).skip(1) {
+            key.a >>= 1;
+            key.b >>= 1;
+            let end = start + self.layers[i].keys.len();
+
+            // Mark the other key as duplicate
+            for (oh, key_) in izip!(path_ohv[start..end].iter(), self.layers[i].keys.iter_mut()) {
+                key_.a.0 ^= u32::from(oh.a.convert().convert()) << shift;
+                key_.b.0 ^= u32::from(oh.b.convert().convert()) << shift;
+            }
+            self.layers[i].keys.push(key.to_owned());
+            start = end;
+        }
+        tracing::trace!("< revoke old path");
     }
 
     /// The insert-protocol without the AND-tree. May be called from either insert or update_or_insert.
@@ -200,29 +207,26 @@ impl LinearScanObliviousMap {
             traces,
         })
     }
-
-    #[instrument(level = "debug", skip_all)]
-    fn revoke_old_path(&mut self, mut key: Rep3RingShare<u32>, path_ohv: Vec<Rep3RingShare<Bit>>) {
-        tracing::trace!("> revoke old path");
-        let shift = LINEAR_SCAN_TREE_DEPTH - 1;
-        self.layers[0].keys.push(key);
-        let mut start = 0;
-        for i in (0..self.layers.len()).skip(1) {
-            key.a >>= 1;
-            key.b >>= 1;
-            let end = start + self.layers[i].keys.len();
-
-            // Mark the other key as duplicate
-            for (oh, key_) in izip!(path_ohv[start..end].iter(), self.layers[i].keys.iter_mut()) {
-                key_.a.0 ^= u32::from(oh.a.convert().convert()) << shift;
-                key_.b.0 ^= u32::from(oh.b.convert().convert()) << shift;
+    /// Checks every layer for a match with the key, except the leaf layer.
+    ///
+    /// Insert doesn't need the leaf layer, because value MUST be not present on insert.
+    pub(crate) fn find_path_skip_leaf_layer(
+        &self,
+        mut needle: Rep3RingShare<u32>,
+    ) -> Vec<Rep3RingShare<u32>> {
+        let mut result = Vec::with_capacity(self.total_count - self.leaf_count);
+        for layer in self.layers.iter().skip(1) {
+            needle.a >>= 1;
+            needle.b >>= 1;
+            for hay in layer.keys.iter() {
+                result.push(hay ^ &needle);
             }
-            self.layers[i].keys.push(key.to_owned());
-            start = end;
         }
-        tracing::trace!("< revoke old path");
+        result
     }
+}
 
+impl LinearScanObliviousMap {
     /// Performs the insert-groth16 proof.
     #[instrument(level = "debug", skip_all)]
     pub(crate) fn groth16_insert_proof<N: Rep3NetworkExt>(
@@ -235,7 +239,7 @@ impl LinearScanObliviousMap {
         let InsertWithTrace { inputs, traces } = insert_with_trace;
         let (proof, public_inputs) =
             cosnark::noir_groth16(inputs, traces, &self.write_groth16, net0, net1, state0)?;
-        debug_assert_eq!(public_inputs[1], self.root);
+        debug_assert_eq!(public_inputs[1], self.inner.root);
         Ok(ObliviousWriteResult {
             proof,
             old_root: public_inputs[0],
@@ -243,21 +247,6 @@ impl LinearScanObliviousMap {
             commitment_key: public_inputs[2],
             commitment_value: public_inputs[3],
         })
-    }
-
-    /// Checks every layer for a match with the key, except the leaf layer.
-    ///
-    /// Insert doesn't need the leaf layer, because value MUST be not present on insert.
-    fn find_path_skip_leaf_layer(&self, mut needle: Rep3RingShare<u32>) -> Vec<Rep3RingShare<u32>> {
-        let mut result = Vec::with_capacity(self.total_count - self.leaf_count);
-        for layer in self.layers.iter().skip(1) {
-            needle.a >>= 1;
-            needle.b >>= 1;
-            for hay in layer.keys.iter() {
-                result.push(hay ^ &needle);
-            }
-        }
-        result
     }
 }
 #[cfg(test)]

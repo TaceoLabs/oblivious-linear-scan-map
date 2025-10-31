@@ -11,6 +11,7 @@ use tracing::instrument;
 
 use crate::{
     LinearScanObliviousMap,
+    base::MapBase,
     cosnark::{self, ReadWithTrace},
 };
 
@@ -41,30 +42,14 @@ pub struct ObliviousReadResult {
     pub commitment: ark_bn254::Fr,
 }
 
-impl LinearScanObliviousMap {
-    /// Reads the leaf value associated with the provided secret-shared key from the oblivious Merkle tree.
-    ///
-    /// Read operations can be processed in parallel, but must not overlap with insert or update operations.
-    /// Computes a co-SNARK proof for the read, returning the leaf value, proof, and relevant public inputs.
-    ///
-    /// Needs two network streams that are disjunct from each other for internal parallelizing.
-    ///
-    /// # Returns
-    /// An [`ObliviousReadResult`] containing:
-    /// - The secret-shared leaf value
-    /// - A co-SNARK proof attesting to the read
-    /// - The Merkle root and key commitment as public inputs
-    ///
-    /// # Errors
-    /// Returns an error only if a network failure occurs during the read protocol.
-    #[instrument(level = "debug", skip_all)]
-    pub fn oblivious_read<N: Rep3NetworkExt>(
+impl MapBase {
+    pub(super) fn read<N: Rep3NetworkExt>(
         &self,
         req: ObliviousReadRequest,
         net0: &N,
         net1: &N,
         state0: &mut Rep3State,
-    ) -> eyre::Result<ObliviousReadResult> {
+    ) -> eyre::Result<ReadWithTrace> {
         let ObliviousReadRequest {
             key,
             randomness_commitment,
@@ -80,7 +65,7 @@ impl LinearScanObliviousMap {
 
         // build the poseidon execution traces for the proof.
         tracing::debug!("building read execution trace");
-        let trace = cosnark::build_read_execution_trace(
+        cosnark::build_read_execution_trace(
             path_and_witness,
             bitinject,
             randomness_commitment,
@@ -88,14 +73,14 @@ impl LinearScanObliviousMap {
             net1,
             state0,
             &mut state1,
-        )?;
-        tracing::debug!("creating co-SNARK");
-        self.groth16_read_proof(net0, net1, trace, state0)
+        )
     }
+}
 
+impl LinearScanObliviousMap {
     /// Performs the read-groth16 proof.
     #[instrument(level = "debug", skip_all)]
-    fn groth16_read_proof<N: Rep3NetworkExt>(
+    pub(super) fn groth16_read_proof<N: Rep3NetworkExt>(
         &self,
         net0: &N,
         net1: &N,
@@ -111,8 +96,6 @@ impl LinearScanObliviousMap {
         let (proof, public_inputs) =
             cosnark::noir_groth16(inputs, traces, &self.read_groth16, net0, net1, state0)?;
         tracing::trace!("> groth16 read proof");
-
-        debug_assert_eq!(public_inputs[0], self.root);
         Ok(ObliviousReadResult {
             read: read_value,
             proof,

@@ -6,9 +6,7 @@ use mpc_core::{
 };
 use rand::{CryptoRng, Rng};
 
-use crate::{
-    Groth16Material, LINEAR_SCAN_TREE_DEPTH, LinearScanObliviousMap, ObliviousLayer, mpc,
-};
+use crate::{Groth16Material, LINEAR_SCAN_TREE_DEPTH, LinearScanObliviousMap, ObliviousLayer, mpc};
 
 #[derive(Debug, Default, Clone)]
 struct Layer {

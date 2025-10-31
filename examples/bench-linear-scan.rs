@@ -1,5 +1,6 @@
 use ark_ff::UniformRand as _;
 use clap::Parser;
+use co_noir_to_r1cs::noir::{r1cs, ultrahonk};
 use eyre::{Context, eyre};
 use figment::{
     Figment,
@@ -14,8 +15,8 @@ use mpc_net::{
     tcp::{NetworkConfig, TcpNetwork},
 };
 use oblivious_linear_scan_map::{
-    LinearScanObliviousMap, ObliviousInsertRequest, ObliviousReadRequest, ObliviousUpdateRequest,
-    local::LinearScanMap,
+    Groth16Material, LinearScanObliviousMap, ObliviousInsertRequest, ObliviousReadRequest,
+    ObliviousUpdateRequest, local::LinearScanMap,
 };
 use rand::{CryptoRng, Rng, SeedableRng};
 use rand_chacha::ChaCha12Rng;
@@ -81,7 +82,7 @@ impl Config {
 }
 
 /// Prefix for config env variables
-pub const CONFIG_ENV_PREFIX: &str = "WORLD_";
+pub const CONFIG_ENV_PREFIX: &str = "TACEO_";
 
 fn get_random_map<R: Rng>(num_items: usize, rng: &mut R) -> LinearScanMap {
     let mut keys = Vec::with_capacity(num_items);
@@ -183,6 +184,15 @@ fn main() -> eyre::Result<ExitCode> {
     Ok(ExitCode::SUCCESS)
 }
 
+fn dummy_groth16_material() -> eyre::Result<Groth16Material> {
+    let root = std::env!("CARGO_MANIFEST_DIR");
+    let read_program = ultrahonk::get_program_artifact(format!(
+        "{root}/noir/compiled_circuits/oblivious_map_read.json"
+    ))?;
+    let (proof_schema, pk, cs) = r1cs::setup_r1cs(read_program, &mut rand::thread_rng())?;
+    Ok(Groth16Material::new(proof_schema, cs, pk.clone()))
+}
+
 fn benchmarks<R: Rng + CryptoRng>(config: &Config, rng: &mut R) -> eyre::Result<ExitCode> {
     tracing::info!("Sampling random Map");
     let map = get_random_map(config.num_items, rng);
@@ -210,6 +220,38 @@ fn benchmarks<R: Rng + CryptoRng>(config: &Config, rng: &mut R) -> eyre::Result<
     insert(&map, unused_key, r_idx, r_value, config, rng)?;
     update(&map, used_key, r_idx, r_value, config, rng)?;
     prune(&map, config)?;
+    // only need one party for this
+    if config.network.my_id == 0 {
+        let groth16 = dummy_groth16_material()?;
+        dump_bench(
+            &map,
+            config,
+            ark_serialize::Compress::No,
+            ark_serialize::Validate::No,
+            &groth16,
+        )?;
+        dump_bench(
+            &map,
+            config,
+            ark_serialize::Compress::Yes,
+            ark_serialize::Validate::No,
+            &groth16,
+        )?;
+        dump_bench(
+            &map,
+            config,
+            ark_serialize::Compress::No,
+            ark_serialize::Validate::Yes,
+            &groth16,
+        )?;
+        dump_bench(
+            &map,
+            config,
+            ark_serialize::Compress::Yes,
+            ark_serialize::Validate::Yes,
+            &groth16,
+        )?;
+    }
 
     Ok(ExitCode::SUCCESS)
 }
@@ -305,6 +347,62 @@ fn prune(map: &LinearScanObliviousMap, config: &Config) -> eyre::Result<ExitCode
             Ok(())
         },
     )
+}
+
+fn dump_bench(
+    map: &LinearScanObliviousMap,
+    config: &Config,
+    compressed: ark_serialize::Compress,
+    validate: ark_serialize::Validate,
+    groth16: &Groth16Material,
+) -> eyre::Result<ExitCode> {
+    let mut time_dumps = Vec::with_capacity(config.runs);
+    let mut time_from_dumps = Vec::with_capacity(config.runs);
+    for _ in 0..config.runs {
+        let mut bytes = Vec::new();
+        // DUMP
+        let start = Instant::now();
+        map.dump(&mut bytes, compressed)?;
+        let duration = start.elapsed().as_micros() as f64;
+        time_dumps.push(duration);
+        // FROM DUMP
+        let read_groth16 = groth16.to_owned();
+        let write_groth16 = groth16.to_owned();
+        let start = Instant::now();
+        let map = LinearScanObliviousMap::from_dump(
+            bytes.as_slice(),
+            compressed,
+            validate,
+            read_groth16,
+            write_groth16,
+        )?;
+        let duration = start.elapsed().as_micros() as f64;
+        std::hint::black_box(map);
+        time_from_dumps.push(duration);
+    }
+    let (compressed, validate) = match (compressed, validate) {
+        (ark_serialize::Compress::Yes, ark_serialize::Validate::Yes) => ("yes", "yes"),
+        (ark_serialize::Compress::Yes, ark_serialize::Validate::No) => ("yes", "no"),
+        (ark_serialize::Compress::No, ark_serialize::Validate::Yes) => ("no", "yes"),
+        (ark_serialize::Compress::No, ark_serialize::Validate::No) => ("no", "no"),
+    };
+    print_runtimes(
+        time_dumps,
+        config.network.my_id,
+        &format!(
+            "Dump (n={}, Compress: {compressed}, Validate: {validate})",
+            config.num_items
+        ),
+    );
+    print_runtimes(
+        time_from_dumps,
+        config.network.my_id,
+        &format!(
+            "From Dump (n={}, Compress: {compressed}, Validate: {validate})",
+            config.num_items
+        ),
+    );
+    Ok(ExitCode::SUCCESS)
 }
 
 pub fn bench_op<F>(
