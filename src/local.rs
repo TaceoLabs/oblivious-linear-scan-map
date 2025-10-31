@@ -2,11 +2,72 @@ use ark_ff::{BigInteger256, PrimeField, UniformRand as _, Zero as _};
 use co_noir_to_r1cs::noir::{r1cs, ultrahonk};
 use mpc_core::{
     gadgets::poseidon2::Poseidon2,
-    protocols::rep3_ring::{self, ring::ring_impl::RingElement},
+    protocols::rep3_ring::{self, Rep3RingShare, ring::ring_impl::RingElement},
 };
 use rand::{CryptoRng, Rng};
 
-use crate::{Groth16Material, LINEAR_SCAN_TREE_DEPTH, LinearScanObliviousMap, ObliviousLayer, mpc};
+use crate::{
+    Groth16Material, LINEAR_SCAN_TREE_DEPTH, LinearScanObliviousMap, ObliviousLayer,
+    Rep3BigIntShare, base::MapBase,
+};
+
+impl ObliviousLayer {
+    pub fn new(keys: Vec<Rep3RingShare<u32>>, values: Vec<Rep3BigIntShare<ark_bn254::Fr>>) -> Self {
+        Self { keys, values }
+    }
+}
+
+impl LinearScanObliviousMap {
+    pub fn from_shared_values(
+        layers: [ObliviousLayer; LINEAR_SCAN_TREE_DEPTH],
+        leaf_count: usize,
+        total_count: usize,
+        defaults: [BigInteger256; LINEAR_SCAN_TREE_DEPTH],
+        root: ark_bn254::Fr,
+        read_groth16: Groth16Material,
+        write_groth16: Groth16Material,
+    ) -> Self {
+        Self {
+            inner: MapBase::from_shared_values(layers, leaf_count, total_count, defaults, root),
+            read_groth16,
+            write_groth16,
+        }
+    }
+}
+
+pub fn share_values_ring<F: PrimeField, R: Rng + CryptoRng>(
+    values: &[F],
+    rng: &mut R,
+) -> [Vec<Rep3BigIntShare<F>>; 3] {
+    let mut shares1 = Vec::with_capacity(values.len());
+    let mut shares2 = Vec::with_capacity(values.len());
+    let mut shares3 = Vec::with_capacity(values.len());
+    for val in values {
+        let [share1, share2, share3] = mpc_core::protocols::rep3::share_biguint(*val, rng);
+        shares1.push(share1.try_into().expect("Works"));
+        shares2.push(share2.try_into().expect("Works"));
+        shares3.push(share3.try_into().expect("Works"));
+    }
+    [shares1, shares2, shares3]
+}
+
+impl MapBase {
+    pub fn from_shared_values(
+        layers: [ObliviousLayer; LINEAR_SCAN_TREE_DEPTH],
+        leaf_count: usize,
+        total_count: usize,
+        defaults: [BigInteger256; LINEAR_SCAN_TREE_DEPTH],
+        root: ark_bn254::Fr,
+    ) -> Self {
+        Self {
+            layers,
+            leaf_count,
+            total_count,
+            defaults,
+            root,
+        }
+    }
+}
 
 #[derive(Debug, Default, Clone)]
 struct Layer {
@@ -34,8 +95,7 @@ impl Layer {
         let [key_shares0, key_shares1, key_shares2] =
             rep3_ring::share_ring_elements_binary(&keys, rng);
 
-        let [value_shares0, value_shares1, value_shares2] =
-            mpc::share_values_ring(&self.values, rng);
+        let [value_shares0, value_shares1, value_shares2] = share_values_ring(&self.values, rng);
 
         let res0 = ObliviousLayer::new(key_shares0, value_shares0);
         let res1 = ObliviousLayer::new(key_shares1, value_shares1);

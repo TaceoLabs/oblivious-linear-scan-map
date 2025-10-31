@@ -13,7 +13,6 @@ use mpc_core::protocols::{
     },
 };
 use mpc_net::Network;
-use rand::{CryptoRng, Rng};
 
 // TODO check out https://github.com/recmo/uint for share over F::BigInt
 #[derive(Default, Debug, Clone, Copy, CanonicalSerialize, CanonicalDeserialize)]
@@ -23,21 +22,6 @@ pub struct Rep3BigIntShare<F: PrimeField> {
     /// Share of the prev party
     pub b: F::BigInt,
     pub(crate) phantom: PhantomData<F>,
-}
-pub fn share_values_ring<F: PrimeField, R: Rng + CryptoRng>(
-    values: &[F],
-    rng: &mut R,
-) -> [Vec<Rep3BigIntShare<F>>; 3] {
-    let mut shares1 = Vec::with_capacity(values.len());
-    let mut shares2 = Vec::with_capacity(values.len());
-    let mut shares3 = Vec::with_capacity(values.len());
-    for val in values {
-        let [share1, share2, share3] = mpc_core::protocols::rep3::share_biguint(*val, rng);
-        shares1.push(share1.try_into().expect("Works"));
-        shares2.push(share2.try_into().expect("Works"));
-        shares3.push(share3.try_into().expect("Works"));
-    }
-    [shares1, shares2, shares3]
 }
 
 impl<F: PrimeField> TryFrom<Rep3BigUintShare<F>> for Rep3BigIntShare<F> {

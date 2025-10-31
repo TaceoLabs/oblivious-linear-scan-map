@@ -68,23 +68,6 @@ impl MapBase {
         }
     }
 
-    #[cfg(feature = "local")]
-    pub fn from_shared_values(
-        layers: [ObliviousLayer; LINEAR_SCAN_TREE_DEPTH],
-        leaf_count: usize,
-        total_count: usize,
-        defaults: [BigInteger256; LINEAR_SCAN_TREE_DEPTH],
-        root: ark_bn254::Fr,
-    ) -> Self {
-        Self {
-            layers,
-            leaf_count,
-            total_count,
-            defaults,
-            root,
-        }
-    }
-
     #[instrument(level = "debug", skip_all)]
     pub(crate) fn key_decompose<N: Rep3NetworkExt>(
         key: Rep3RingShare<u32>,

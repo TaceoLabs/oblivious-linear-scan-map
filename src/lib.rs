@@ -1,7 +1,7 @@
 // #![deny(missing_docs)]
 //! test
 
-use ark_ff::{BigInteger256, PrimeField, Zero as _};
+use ark_ff::{PrimeField, Zero as _};
 
 use ark_serialize::CanonicalDeserialize;
 use ark_serialize::CanonicalSerialize;
@@ -16,6 +16,7 @@ use tracing::instrument;
 
 use crate::base::MapBase;
 use crate::{insert::InsertTail, update::UpdateTail};
+
 mod base;
 pub(crate) mod cosnark;
 mod insert;
@@ -47,13 +48,6 @@ pub struct ObliviousLayer {
     values: Vec<Rep3BigIntShare<ark_bn254::Fr>>,
 }
 
-impl ObliviousLayer {
-    #[cfg(feature = "local")]
-    pub fn new(keys: Vec<Rep3RingShare<u32>>, values: Vec<Rep3BigIntShare<ark_bn254::Fr>>) -> Self {
-        Self { keys, values }
-    }
-}
-
 #[derive(Clone)]
 pub struct LinearScanObliviousMap {
     inner: MapBase,
@@ -80,23 +74,6 @@ impl LinearScanObliviousMap {
 
         Self {
             inner: MapBase::new(defaults, default_value),
-            read_groth16,
-            write_groth16,
-        }
-    }
-
-    #[cfg(feature = "local")]
-    pub fn from_shared_values(
-        layers: [ObliviousLayer; LINEAR_SCAN_TREE_DEPTH],
-        leaf_count: usize,
-        total_count: usize,
-        defaults: [BigInteger256; LINEAR_SCAN_TREE_DEPTH],
-        root: ark_bn254::Fr,
-        read_groth16: Groth16Material,
-        write_groth16: Groth16Material,
-    ) -> Self {
-        Self {
-            inner: MapBase::from_shared_values(layers, leaf_count, total_count, defaults, root),
             read_groth16,
             write_groth16,
         }
