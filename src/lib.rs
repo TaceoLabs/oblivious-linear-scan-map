@@ -28,6 +28,8 @@ mod prune;
 mod read;
 mod update;
 
+pub use co_noir_to_r1cs;
+
 pub use cosnark::Groth16Material;
 pub use insert::ObliviousInsertRequest;
 pub use insert::ObliviousWriteResult;
