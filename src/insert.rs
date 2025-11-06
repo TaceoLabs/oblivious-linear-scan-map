@@ -249,6 +249,19 @@ impl LinearScanObliviousMap {
         })
     }
 }
+
+impl ObliviousWriteResult {
+    /// Returns the public inputs in a `Vec` in the correct order.
+    pub fn inputs_to_vec(&self) -> Vec<ark_bn254::Fr> {
+        vec![
+            self.old_root,
+            self.new_root,
+            self.commitment_key,
+            self.commitment_value,
+        ]
+    }
+}
+
 #[cfg(test)]
 mod tests {
 
@@ -261,20 +274,9 @@ mod tests {
     use mpc_net::local::LocalNetwork;
 
     use crate::{
-        LinearScanObliviousMap, ObliviousInsertRequest, ObliviousReadRequest, ObliviousWriteResult,
+        LinearScanObliviousMap, ObliviousInsertRequest, ObliviousReadRequest,
         tests::groth16_material,
     };
-
-    impl ObliviousWriteResult {
-        pub(crate) fn inputs_to_vec(&self) -> Vec<ark_bn254::Fr> {
-            vec![
-                self.old_root,
-                self.new_root,
-                self.commitment_key,
-                self.commitment_value,
-            ]
-        }
-    }
 
     #[test]
     fn insert_then_read() -> eyre::Result<()> {
